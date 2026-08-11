@@ -10,8 +10,8 @@ public partial class InventoryItemAnalyzer
 {
     public override void DrawSettings()
     {
-        ImGui.TextColored(new Vector4(0.20f, 0.75f, 1.00f, 1f), "INVENTORY ITEM ANALYZER");
-        ImGui.TextDisabled("Detailed item inspection, tiers, defenses and loot rating.");
+        ImGui.TextColored(new Vector4(0.20f, 0.75f, 1.00f, 1f), "LOOTLENS");
+        ImGui.TextDisabled("Item inspection, modifier tiers, defenses and configurable loot ratings.");
         ImGui.Separator();
 
         if (!ImGui.BeginTabBar("##analyzer_main_tabs"))
@@ -29,6 +29,31 @@ public partial class InventoryItemAnalyzer
             ImGui.EndTabItem();
         }
         ImGui.EndTabBar();
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+        ImGui.TextDisabled("Made by woogo");
+        ImGui.SameLine(0f, 4f);
+
+        var heartPos = ImGui.GetCursorScreenPos();
+        var lineHeight = ImGui.GetTextLineHeight();
+        DrawFooterHeart(ImGui.GetWindowDrawList(),
+            new Vector2(heartPos.X + 6f, heartPos.Y + lineHeight * .48f));
+        ImGui.Dummy(new Vector2(13f, lineHeight));
+
+        ImGui.SameLine(0f, 4f);
+        ImGui.TextDisabled(
+            "please feel free to message me on Discord with any errors or suggestions.");
+    }
+
+    private static void DrawFooterHeart(ImDrawListPtr draw, Vector2 center)
+    {
+        var color = Col(.88f, .30f, .40f, .88f);
+        draw.AddCircleFilled(center + new Vector2(-2.6f, -1.8f), 3.5f, color, 12);
+        draw.AddCircleFilled(center + new Vector2(2.6f, -1.8f), 3.5f, color, 12);
+        draw.AddTriangleFilled(center + new Vector2(-6f, 0f),
+            center + new Vector2(6f, 0f), center + new Vector2(0f, 7f), color);
     }
 
     private void DrawAnalyzerSettings()
@@ -37,8 +62,10 @@ public partial class InventoryItemAnalyzer
         ImGui.TextDisabled("ITEM ANALYZER");
         ImGui.Separator();
         Toggle("Enable Plugin", Settings.Enable);
-        Toggle("Item Info Overlay", Settings.ShowItemInfo);
-        Toggle("Always Show Item Info", Settings.AlwaysShowItemInfo);
+        DrawItemInfoModeSelector();
+
+        if (Settings.ShowItemInfo.Value)
+            DrawDefaultAnalyzerViewSelector();
 
         ImGui.Spacing();
         ImGui.TextDisabled("APPEARANCE");
@@ -46,23 +73,109 @@ public partial class InventoryItemAnalyzer
         Slider("Width", Settings.ItemInfoWidth);
         ColorNodeEditor("Background", Settings.ItemInfoBackground);
         ColorNodeEditor("Border", Settings.ItemInfoBorder);
-        ColorNodeEditor("Tier Color", Settings.ItemInfoTierColor);
+        ColorNodeEditor("Tier Highlight", Settings.ItemInfoTierColor);
+
+        if (ImGui.Button("Reset Analyzer Appearance"))
+        {
+            Settings.ItemInfoWidth.Value = 310;
+            Settings.ItemInfoBackground.Value = new SharpDX.Color(15, 15, 20, 245);
+            Settings.ItemInfoBorder.Value = new SharpDX.Color(110, 110, 125, 255);
+            Settings.ItemInfoTierColor.Value = SharpDX.Color.Gold;
+        }
+
+        if (ShouldShowAnalyzerKeybind())
+        {
+            ImGui.Spacing();
+            ImGui.TextDisabled("KEYBIND");
+            ImGui.Separator();
+            DrawFullAnalyzerKeybind();
+        }
 
         ImGui.Spacing();
-        ImGui.TextDisabled("KEYBIND");
-        ImGui.Separator();
-        DrawFullAnalyzerKeybind();
-
-        ImGui.Spacing();
-        Toggle("DEBUG Mode", Settings.ItemInfoDebugMode);
-        ImGui.TextDisabled("The inspection key is configured in the normal plugin settings.");
+        if (ImGui.CollapsingHeader("ADVANCED"))
+        {
+            Toggle("Debug Mode", Settings.ItemInfoDebugMode);
+            ImGui.TextDisabled("Shows diagnostic item-member data in the full analyzer.");
+        }
     }
+
+    private void DrawItemInfoModeSelector()
+    {
+        var mode = !Settings.ShowItemInfo.Value
+            ? 0
+            : Settings.AlwaysShowItemInfo.Value ? 1 : 2;
+
+        ImGui.Text("Item Info Mode");
+        ImGui.SameLine();
+
+        if (ImGui.RadioButton("Off##item_info_mode", mode == 0))
+        {
+            Settings.ShowItemInfo.Value = false;
+            mode = 0;
+        }
+
+        ImGui.SameLine();
+        if (ImGui.RadioButton("Show on Hover##item_info_mode", mode == 1))
+        {
+            Settings.ShowItemInfo.Value = true;
+            Settings.AlwaysShowItemInfo.Value = true;
+            mode = 1;
+        }
+
+        ImGui.SameLine();
+        if (ImGui.RadioButton("Hold Key##item_info_mode", mode == 2))
+        {
+            Settings.ShowItemInfo.Value = true;
+            Settings.AlwaysShowItemInfo.Value = false;
+            mode = 2;
+        }
+
+        if (mode == 0)
+            ImGui.TextDisabled("Gold and red inventory stars remain available; the item analyzer panel is hidden.");
+        else if (mode == 1)
+            ImGui.TextDisabled("Shows the analyzer automatically while an inventory item is hovered.");
+        else
+            ImGui.TextDisabled("Shows the analyzer only while its key is held over an inventory item.");
+    }
+
+    private void DrawDefaultAnalyzerViewSelector()
+    {
+        var compact = Settings.ItemInfoCompactMode.Value;
+
+        ImGui.Text("Default View");
+        ImGui.SameLine();
+        if (ImGui.RadioButton("Compact (Recommended)##analyzer_view", compact))
+        {
+            Settings.ItemInfoCompactMode.Value = true;
+            compact = true;
+        }
+
+        ImGui.SameLine();
+        if (ImGui.RadioButton("Full##analyzer_view", !compact))
+        {
+            Settings.ItemInfoCompactMode.Value = false;
+            compact = false;
+        }
+
+        ImGui.TextDisabled(compact
+            ? "Uses the small summary panel; hold the analyzer key for full modifier details."
+            : "Shows the complete modifier and tier breakdown by default.");
+    }
+
+    private bool ShouldShowAnalyzerKeybind()
+    {
+        return Settings.ShowItemInfo.Value &&
+               (!Settings.AlwaysShowItemInfo.Value || Settings.ItemInfoCompactMode.Value);
+    }
+
     private bool _capturingFullAnalyzerKey;
-    private static readonly string[] _keyNames = BuildKeyNames();
 
     private void DrawFullAnalyzerKeybind()
     {
-        ImGui.Text("Hold Key for Full Analyzer");
+        var showOnlyWhileHeld = !Settings.AlwaysShowItemInfo.Value;
+        ImGui.Text(showOnlyWhileHeld
+            ? "Hold Key to Show Analyzer"
+            : "Hold Key for Full Analyzer");
         ImGui.SameLine();
 
         var currentKey = (int)Settings.ItemInfoHotkey.Value;
@@ -94,7 +207,9 @@ public partial class InventoryItemAnalyzer
         }
 
         ImGui.SameLine();
-        ImGui.TextDisabled("Hold this key to temporarily show the full analyzer.");
+        ImGui.TextDisabled(showOnlyWhileHeld
+            ? "The analyzer is visible while this key is held."
+            : "Temporarily expands the compact panel to its full details.");
     }
 
     private static string GetKeyDisplayName(int key)
@@ -115,14 +230,6 @@ public partial class InventoryItemAnalyzer
         return $"VK {key}";
     }
 
-    private static string[] BuildKeyNames()
-    {
-        var result = new string[256];
-        for (var i = 0; i < result.Length; i++)
-            result[i] = GetKeyDisplayName(i);
-        return result;
-    }
-
     private void DrawCustomStarsSettings()
     {
         ImGui.Spacing();
@@ -141,7 +248,10 @@ public partial class InventoryItemAnalyzer
         DrawStarTab("Ring", 6);
         DrawStarTab("Amulet", 7);
         DrawStarTab("Quiver", 8);
-        DrawStarTab("Weapon", 9);
+        DrawStarTab("Melee Weapon", 9);
+        DrawStarTab("Bow", 10);
+        DrawStarTab("Caster Weapon", 11);
+        DrawSpecialModsTab();
 
         ImGui.EndTabBar();
     }
@@ -159,24 +269,27 @@ public partial class InventoryItemAnalyzer
         ImGui.SameLine();
         ImGui.TextDisabled("- USER-DEFINED STAR RULES");
 
-        if (name == "Weapon")
+        if (name == "Melee Weapon" || name == "Bow")
         {
             ImGui.Spacing();
             ImGui.TextDisabled("WEAPON QUALIFIER");
             ImGui.Separator();
 
-            var dpsMode = Settings.Star_Weapon_DpsMode.Value;
+            var dpsNode = name == "Bow"
+                ? Settings.Star_Bow_DpsMode
+                : Settings.Star_Weapon_DpsMode;
+            var dpsMode = dpsNode.Value;
             ImGui.Text("Qualify weapons by:");
             ImGui.SameLine();
             if (ImGui.RadioButton("Physical DPS", dpsMode == 0))
             {
-                Settings.Star_Weapon_DpsMode.Value = 0;
+                dpsNode.Value = 0;
                 dpsMode = 0;
             }
             ImGui.SameLine();
             if (ImGui.RadioButton("Total Weapon DPS", dpsMode == 1))
             {
-                Settings.Star_Weapon_DpsMode.Value = 1;
+                dpsNode.Value = 1;
                 dpsMode = 1;
             }
 
@@ -201,20 +314,17 @@ public partial class InventoryItemAnalyzer
         foreach (var stat in slot.Stats)
         {
             var displayName = stat.Name;
-            if (name == "Weapon" && stat.Name == "Weapon DPS")
-                displayName = Settings.Star_Weapon_DpsMode.Value == 0
+            if ((name == "Melee Weapon" || name == "Bow") && stat.Name == "Weapon DPS")
+            {
+                var dpsMode = name == "Bow"
+                    ? Settings.Star_Bow_DpsMode.Value
+                    : Settings.Star_Weapon_DpsMode.Value;
+                displayName = dpsMode == 0
                     ? "Physical DPS"
                     : "Total Weapon DPS";
-
-            Slider(displayName, stat.Node);
-if (ImGui.IsItemHovered())
-            {
-                ImGui.BeginTooltip();
-                ImGui.Text("Set to 0 to ignore this stat.");
-                ImGui.Separator();
-                ImGui.TextDisabled("Threshold = minimum qualifying roll.");
-                ImGui.EndTooltip();
             }
+
+            DrawConfiguredStatSlider(displayName, stat.Name, stat.Node);
         }
 
         ImGui.Spacing();
@@ -224,6 +334,39 @@ if (ImGui.IsItemHovered())
         if (ImGui.Button($"Reset {name}"))
             ResetStarSlot(index);
 
+        ImGui.EndTabItem();
+    }
+
+    private void DrawSpecialModsTab()
+    {
+        if (!ImGui.BeginTabItem("Special Mods##special_mod_stars"))
+            return;
+
+        ImGui.Spacing();
+        ImGui.TextColored(new Vector4(0.95f, 0.25f, 0.30f, 1f),
+            "SPECIAL MODS - RED STARS");
+        ImGui.TextDisabled("Each matched rule adds one red star. Red stars are separate from gold stars.");
+        ImGui.Separator();
+
+        Toggle("Show Special Mod Stars", Settings.ShowSpecialStars);
+        ColorNodeEditor("Red Star Color", Settings.SpecialStarColor);
+
+        ImGui.Spacing();
+        ImGui.TextDisabled("RULES (one per line: Slot|modifier text)");
+        ImGui.TextDisabled("Use Any|text for all slots. Matching is case-insensitive.");
+
+        var rules = Settings.SpecialModifierRules ?? string.Empty;
+        if (ImGui.InputTextMultiline("##special_mod_rules", ref rules, 16384,
+            new Vector2(-1f, 300f)))
+            Settings.SpecialModifierRules = rules;
+
+        if (ImGui.Button("Restore All Recommended Rules"))
+            Settings.SpecialModifierRules =
+                global::InventoryItemAnalyzer.Settings.DefaultSpecialModifierRules;
+
+        ImGui.Spacing();
+        ImGui.TextDisabled("Includes recommended Helmet, Body, Gloves, Boots, Shield, Belt,");
+        ImGui.TextDisabled("Ring, Amulet, Quiver, Melee, Bow, and Caster rules.");
         ImGui.EndTabItem();
     }
 
@@ -238,7 +381,9 @@ if (ImGui.IsItemHovered())
         ["Star_Helmet_FireResistance"] = 30,
         ["Star_Helmet_LightningResistance"] = 30,
         ["Star_Helmet_ChaosResistance"] = 20,
-        ["Star_Helmet_EnergyShield"] = 100,
+        ["Star_Helmet_Armour"] = 700,
+        ["Star_Helmet_Evasion"] = 700,
+        ["Star_Helmet_EnergyShield"] = 160,
         ["Star_Helmet_SpellSuppression"] = 12,
         ["Star_Helmet_Attributes"] = 30,
         ["Star_BodyArmour_GoodRequired"] = 2,
@@ -249,7 +394,9 @@ if (ImGui.IsItemHovered())
         ["Star_BodyArmour_FireResistance"] = 30,
         ["Star_BodyArmour_LightningResistance"] = 30,
         ["Star_BodyArmour_ChaosResistance"] = 20,
-        ["Star_BodyArmour_EnergyShield"] = 100,
+        ["Star_BodyArmour_Armour"] = 1600,
+        ["Star_BodyArmour_Evasion"] = 1600,
+        ["Star_BodyArmour_EnergyShield"] = 400,
         ["Star_BodyArmour_SpellSuppression"] = 12,
         ["Star_BodyArmour_Attributes"] = 30,
         ["Star_Gloves_GoodRequired"] = 2,
@@ -260,10 +407,16 @@ if (ImGui.IsItemHovered())
         ["Star_Gloves_FireResistance"] = 30,
         ["Star_Gloves_LightningResistance"] = 30,
         ["Star_Gloves_ChaosResistance"] = 20,
+        ["Star_Gloves_Armour"] = 450,
+        ["Star_Gloves_Evasion"] = 450,
+        ["Star_Gloves_EnergyShield"] = 110,
         ["Star_Gloves_SpellSuppression"] = 12,
         ["Star_Gloves_AttackSpeed"] = 10,
         ["Star_Gloves_CastSpeed"] = 10,
+        ["Star_Gloves_CritChance"] = 0,
         ["Star_Gloves_CritMultiplier"] = 20,
+        ["Star_Gloves_Accuracy"] = 0,
+        ["Star_Gloves_DotMultiplier"] = 0,
         ["Star_Gloves_Attributes"] = 30,
         ["Star_Boots_GoodRequired"] = 2,
         ["Star_Boots_GreatRequired"] = 3,
@@ -273,9 +426,13 @@ if (ImGui.IsItemHovered())
         ["Star_Boots_FireResistance"] = 30,
         ["Star_Boots_LightningResistance"] = 30,
         ["Star_Boots_ChaosResistance"] = 20,
+        ["Star_Boots_Armour"] = 450,
+        ["Star_Boots_Evasion"] = 450,
+        ["Star_Boots_EnergyShield"] = 110,
         ["Star_Boots_SpellSuppression"] = 12,
         ["Star_Boots_Attributes"] = 30,
         ["Star_Boots_MovementSpeed"] = 30,
+        ["Star_Boots_CooldownRecovery"] = 0,
         ["Star_Belt_GoodRequired"] = 2,
         ["Star_Belt_GreatRequired"] = 3,
         ["Star_Belt_ExcellentRequired"] = 4,
@@ -286,6 +443,7 @@ if (ImGui.IsItemHovered())
         ["Star_Belt_ChaosResistance"] = 20,
         ["Star_Belt_Attributes"] = 30,
         ["Star_Belt_Mana"] = 50,
+        ["Star_Belt_CooldownRecovery"] = 0,
         ["Star_Ring_GoodRequired"] = 2,
         ["Star_Ring_GreatRequired"] = 3,
         ["Star_Ring_ExcellentRequired"] = 4,
@@ -298,8 +456,10 @@ if (ImGui.IsItemHovered())
         ["Star_Ring_Mana"] = 50,
         ["Star_Ring_AttackSpeed"] = 10,
         ["Star_Ring_CastSpeed"] = 10,
+        ["Star_Ring_CritChance"] = 0,
         ["Star_Ring_CritMultiplier"] = 20,
         ["Star_Ring_Accuracy"] = 200,
+        ["Star_Ring_DotMultiplier"] = 0,
         ["Star_Amulet_GoodRequired"] = 2,
         ["Star_Amulet_GreatRequired"] = 3,
         ["Star_Amulet_ExcellentRequired"] = 4,
@@ -311,7 +471,10 @@ if (ImGui.IsItemHovered())
         ["Star_Amulet_Attributes"] = 30,
         ["Star_Amulet_EnergyShield"] = 100,
         ["Star_Amulet_GemLevels"] = 1,
+        ["Star_Amulet_SpecificGemLevels"] = 0,
+        ["Star_Amulet_CritChance"] = 0,
         ["Star_Amulet_CritMultiplier"] = 20,
+        ["Star_Amulet_DotMultiplier"] = 0,
         ["Star_Shield_GoodRequired"] = 2,
         ["Star_Shield_GreatRequired"] = 3,
         ["Star_Shield_ExcellentRequired"] = 4,
@@ -320,7 +483,9 @@ if (ImGui.IsItemHovered())
         ["Star_Shield_FireResistance"] = 30,
         ["Star_Shield_LightningResistance"] = 30,
         ["Star_Shield_ChaosResistance"] = 20,
-        ["Star_Shield_EnergyShield"] = 100,
+        ["Star_Shield_Armour"] = 700,
+        ["Star_Shield_Evasion"] = 700,
+        ["Star_Shield_EnergyShield"] = 140,
         ["Star_Shield_SpellSuppression"] = 12,
         ["Star_Shield_Attributes"] = 30,
         ["Star_Quiver_GoodRequired"] = 2,
@@ -332,19 +497,49 @@ if (ImGui.IsItemHovered())
         ["Star_Quiver_LightningResistance"] = 30,
         ["Star_Quiver_ChaosResistance"] = 20,
         ["Star_Quiver_AttackSpeed"] = 10,
+        ["Star_Quiver_CritChance"] = 0,
         ["Star_Quiver_CritMultiplier"] = 20,
+        ["Star_Quiver_Accuracy"] = 0,
+        ["Star_Quiver_DotMultiplier"] = 0,
         ["Star_Quiver_Attributes"] = 30,
         ["Star_Weapon_GoodRequired"] = 2,
         ["Star_Weapon_GreatRequired"] = 3,
         ["Star_Weapon_ExcellentRequired"] = 4,
         ["Star_Weapon_WeaponDps"] = 200,
+        ["Star_Weapon_DpsMode"] = 1,
         ["Star_Weapon_AttackSpeed"] = 10,
+        ["Star_Weapon_CritChance"] = 0,
         ["Star_Weapon_CritMultiplier"] = 20,
+        ["Star_Weapon_Accuracy"] = 0,
+        ["Star_Weapon_DotMultiplier"] = 0,
         ["Star_Weapon_ColdResistance"] = 30,
         ["Star_Weapon_FireResistance"] = 30,
         ["Star_Weapon_LightningResistance"] = 30,
         ["Star_Weapon_Attributes"] = 30,
-        ["Star_Weapon_GemLevels"] = 1
+        ["Star_Weapon_GemLevels"] = 1,
+        ["Star_Weapon_SpecificGemLevels"] = 0,
+        ["Star_Bow_GoodRequired"] = 2,
+        ["Star_Bow_GreatRequired"] = 3,
+        ["Star_Bow_ExcellentRequired"] = 4,
+        ["Star_Bow_WeaponDps"] = 250,
+        ["Star_Bow_DpsMode"] = 1,
+        ["Star_Bow_AttackSpeed"] = 10,
+        ["Star_Bow_CritChance"] = 20,
+        ["Star_Bow_CritMultiplier"] = 20,
+        ["Star_Bow_Accuracy"] = 300,
+        ["Star_Bow_DotMultiplier"] = 0,
+        ["Star_Bow_GemLevels"] = 0,
+        ["Star_CasterWeapon_GoodRequired"] = 2,
+        ["Star_CasterWeapon_GreatRequired"] = 3,
+        ["Star_CasterWeapon_ExcellentRequired"] = 4,
+        ["Star_CasterWeapon_SpellDamage"] = 60,
+        ["Star_CasterWeapon_CastSpeed"] = 10,
+        ["Star_CasterWeapon_CritChance"] = 0,
+        ["Star_CasterWeapon_CritMultiplier"] = 20,
+        ["Star_CasterWeapon_DotMultiplier"] = 15,
+        ["Star_CasterWeapon_Mana"] = 60,
+        ["Star_CasterWeapon_GemLevels"] = 1,
+        ["Star_CasterWeapon_SpecificGemLevels"] = 0
     };
 
     private void ResetStarSlot(int index)
@@ -352,7 +547,7 @@ if (ImGui.IsItemHovered())
         string[] slotNames =
         {
             "Helmet", "BodyArmour", "Gloves", "Boots", "Shield",
-            "Belt", "Ring", "Amulet", "Quiver", "Weapon"
+            "Belt", "Ring", "Amulet", "Quiver", "Weapon", "Bow", "CasterWeapon"
         };
 
         if (index < 0 || index >= slotNames.Length)
@@ -387,6 +582,8 @@ if (ImGui.IsItemHovered())
                     ("Fire Resistance", Settings.Star_Helmet_FireResistance),
                     ("Lightning Resistance", Settings.Star_Helmet_LightningResistance),
                     ("Chaos Resistance", Settings.Star_Helmet_ChaosResistance),
+                    ("Armour", Settings.Star_Helmet_Armour),
+                    ("Evasion", Settings.Star_Helmet_Evasion),
                     ("Energy Shield", Settings.Star_Helmet_EnergyShield),
                     ("Spell Suppression", Settings.Star_Helmet_SpellSuppression),
                     ("Attributes", Settings.Star_Helmet_Attributes));
@@ -401,6 +598,8 @@ if (ImGui.IsItemHovered())
                     ("Fire Resistance", Settings.Star_BodyArmour_FireResistance),
                     ("Lightning Resistance", Settings.Star_BodyArmour_LightningResistance),
                     ("Chaos Resistance", Settings.Star_BodyArmour_ChaosResistance),
+                    ("Armour", Settings.Star_BodyArmour_Armour),
+                    ("Evasion", Settings.Star_BodyArmour_Evasion),
                     ("Energy Shield", Settings.Star_BodyArmour_EnergyShield),
                     ("Spell Suppression", Settings.Star_BodyArmour_SpellSuppression),
                     ("Attributes", Settings.Star_BodyArmour_Attributes));
@@ -415,10 +614,16 @@ if (ImGui.IsItemHovered())
                     ("Fire Resistance", Settings.Star_Gloves_FireResistance),
                     ("Lightning Resistance", Settings.Star_Gloves_LightningResistance),
                     ("Chaos Resistance", Settings.Star_Gloves_ChaosResistance),
+                    ("Armour", Settings.Star_Gloves_Armour),
+                    ("Evasion", Settings.Star_Gloves_Evasion),
+                    ("Energy Shield", Settings.Star_Gloves_EnergyShield),
                     ("Spell Suppression", Settings.Star_Gloves_SpellSuppression),
                     ("Attack Speed", Settings.Star_Gloves_AttackSpeed),
                     ("Cast Speed", Settings.Star_Gloves_CastSpeed),
+                    ("Critical Strike Chance", Settings.Star_Gloves_CritChance),
                     ("Crit Multiplier", Settings.Star_Gloves_CritMultiplier),
+                    ("Accuracy", Settings.Star_Gloves_Accuracy),
+                    ("DoT Multiplier", Settings.Star_Gloves_DotMultiplier),
                     ("Attributes", Settings.Star_Gloves_Attributes));
 
             case 3:
@@ -431,9 +636,13 @@ if (ImGui.IsItemHovered())
                     ("Fire Resistance", Settings.Star_Boots_FireResistance),
                     ("Lightning Resistance", Settings.Star_Boots_LightningResistance),
                     ("Chaos Resistance", Settings.Star_Boots_ChaosResistance),
+                    ("Armour", Settings.Star_Boots_Armour),
+                    ("Evasion", Settings.Star_Boots_Evasion),
+                    ("Energy Shield", Settings.Star_Boots_EnergyShield),
                     ("Spell Suppression", Settings.Star_Boots_SpellSuppression),
                     ("Attributes", Settings.Star_Boots_Attributes),
-                    ("Movement Speed", Settings.Star_Boots_MovementSpeed));
+                    ("Movement Speed", Settings.Star_Boots_MovementSpeed),
+                    ("Cooldown Recovery", Settings.Star_Boots_CooldownRecovery));
 
             case 4:
                 return Slot("Shield",
@@ -445,6 +654,8 @@ if (ImGui.IsItemHovered())
                     ("Fire Resistance", Settings.Star_Shield_FireResistance),
                     ("Lightning Resistance", Settings.Star_Shield_LightningResistance),
                     ("Chaos Resistance", Settings.Star_Shield_ChaosResistance),
+                    ("Armour", Settings.Star_Shield_Armour),
+                    ("Evasion", Settings.Star_Shield_Evasion),
                     ("Energy Shield", Settings.Star_Shield_EnergyShield),
                     ("Spell Suppression", Settings.Star_Shield_SpellSuppression),
                     ("Attributes", Settings.Star_Shield_Attributes));
@@ -460,7 +671,8 @@ if (ImGui.IsItemHovered())
                     ("Lightning Resistance", Settings.Star_Belt_LightningResistance),
                     ("Chaos Resistance", Settings.Star_Belt_ChaosResistance),
                     ("Attributes", Settings.Star_Belt_Attributes),
-                    ("Mana", Settings.Star_Belt_Mana));
+                    ("Mana", Settings.Star_Belt_Mana),
+                    ("Cooldown Recovery", Settings.Star_Belt_CooldownRecovery));
 
             case 6:
                 return Slot("Ring",
@@ -476,8 +688,10 @@ if (ImGui.IsItemHovered())
                     ("Mana", Settings.Star_Ring_Mana),
                     ("Attack Speed", Settings.Star_Ring_AttackSpeed),
                     ("Cast Speed", Settings.Star_Ring_CastSpeed),
+                    ("Critical Strike Chance", Settings.Star_Ring_CritChance),
                     ("Crit Multiplier", Settings.Star_Ring_CritMultiplier),
-                    ("Accuracy", Settings.Star_Ring_Accuracy));
+                    ("Accuracy", Settings.Star_Ring_Accuracy),
+                    ("DoT Multiplier", Settings.Star_Ring_DotMultiplier));
 
             case 7:
                 return Slot("Amulet",
@@ -492,7 +706,10 @@ if (ImGui.IsItemHovered())
                     ("Attributes", Settings.Star_Amulet_Attributes),
                     ("Energy Shield", Settings.Star_Amulet_EnergyShield),
                     ("Gem Levels", Settings.Star_Amulet_GemLevels),
-                    ("Crit Multiplier", Settings.Star_Amulet_CritMultiplier));
+                    ("Specific Gem Levels", Settings.Star_Amulet_SpecificGemLevels),
+                    ("Critical Strike Chance", Settings.Star_Amulet_CritChance),
+                    ("Crit Multiplier", Settings.Star_Amulet_CritMultiplier),
+                    ("DoT Multiplier", Settings.Star_Amulet_DotMultiplier));
 
             case 8:
                 return Slot("Quiver",
@@ -505,22 +722,56 @@ if (ImGui.IsItemHovered())
                     ("Lightning Resistance", Settings.Star_Quiver_LightningResistance),
                     ("Chaos Resistance", Settings.Star_Quiver_ChaosResistance),
                     ("Attack Speed", Settings.Star_Quiver_AttackSpeed),
+                    ("Critical Strike Chance", Settings.Star_Quiver_CritChance),
                     ("Crit Multiplier", Settings.Star_Quiver_CritMultiplier),
+                    ("Accuracy", Settings.Star_Quiver_Accuracy),
+                    ("DoT Multiplier", Settings.Star_Quiver_DotMultiplier),
                     ("Attributes", Settings.Star_Quiver_Attributes));
 
-            default:
-                return Slot("Weapon",
+            case 9:
+                return Slot("Melee Weapon",
                     Settings.Star_Weapon_GoodRequired,
                     Settings.Star_Weapon_GreatRequired,
                     Settings.Star_Weapon_ExcellentRequired,
                     ("Weapon DPS", Settings.Star_Weapon_WeaponDps),
                     ("Attack Speed", Settings.Star_Weapon_AttackSpeed),
+                    ("Critical Strike Chance", Settings.Star_Weapon_CritChance),
                     ("Crit Multiplier", Settings.Star_Weapon_CritMultiplier),
+                    ("Accuracy", Settings.Star_Weapon_Accuracy),
+                    ("DoT Multiplier", Settings.Star_Weapon_DotMultiplier),
                     ("Cold Resistance", Settings.Star_Weapon_ColdResistance),
                     ("Fire Resistance", Settings.Star_Weapon_FireResistance),
                     ("Lightning Resistance", Settings.Star_Weapon_LightningResistance),
                     ("Attributes", Settings.Star_Weapon_Attributes),
-                    ("Gem Levels", Settings.Star_Weapon_GemLevels));
+                    ("Gem Levels", Settings.Star_Weapon_GemLevels),
+                    ("Specific Gem Levels", Settings.Star_Weapon_SpecificGemLevels));
+
+            case 10:
+                return Slot("Bow",
+                    Settings.Star_Bow_GoodRequired,
+                    Settings.Star_Bow_GreatRequired,
+                    Settings.Star_Bow_ExcellentRequired,
+                    ("Weapon DPS", Settings.Star_Bow_WeaponDps),
+                    ("Attack Speed", Settings.Star_Bow_AttackSpeed),
+                    ("Critical Strike Chance", Settings.Star_Bow_CritChance),
+                    ("Crit Multiplier", Settings.Star_Bow_CritMultiplier),
+                    ("Accuracy", Settings.Star_Bow_Accuracy),
+                    ("DoT Multiplier", Settings.Star_Bow_DotMultiplier),
+                    ("Gem Levels", Settings.Star_Bow_GemLevels));
+
+            default:
+                return Slot("Caster Weapon",
+                    Settings.Star_CasterWeapon_GoodRequired,
+                    Settings.Star_CasterWeapon_GreatRequired,
+                    Settings.Star_CasterWeapon_ExcellentRequired,
+                    ("Spell Damage", Settings.Star_CasterWeapon_SpellDamage),
+                    ("Cast Speed", Settings.Star_CasterWeapon_CastSpeed),
+                    ("Critical Strike Chance", Settings.Star_CasterWeapon_CritChance),
+                    ("Crit Multiplier", Settings.Star_CasterWeapon_CritMultiplier),
+                    ("DoT Multiplier", Settings.Star_CasterWeapon_DotMultiplier),
+                    ("Mana", Settings.Star_CasterWeapon_Mana),
+                    ("Gem Levels", Settings.Star_CasterWeapon_GemLevels),
+                    ("Specific Gem Levels", Settings.Star_CasterWeapon_SpecificGemLevels));
         }
     }
 
@@ -601,11 +852,86 @@ if (ImGui.IsItemHovered())
             node.Value = value;
     }
 
+    private static bool DpsSlider(string id, string label, RangeNode<int> node)
+    {
+        var width = Math.Max(260f, ImGui.GetContentRegionAvail().X * 0.72f);
+        var size = new Vector2(width, 24f);
+        var pos = ImGui.GetCursorScreenPos();
+
+        ImGui.InvisibleButton(id, size);
+        var hovered = ImGui.IsItemHovered();
+        var active = ImGui.IsItemActive();
+
+        if (active && ImGui.IsMouseDown(ImGuiMouseButton.Left))
+        {
+            var mouseX = ImGui.GetIO().MousePos.X;
+            var fraction = Math.Clamp((mouseX - pos.X) / Math.Max(1f, width), 0f, 1f);
+            var value = node.Min + (int)Math.Round(fraction * (node.Max - node.Min));
+            node.Value = Math.Clamp(value, node.Min, node.Max);
+        }
+
+        var fractionFilled = node.Max <= node.Min
+            ? 0f
+            : Math.Clamp((node.Value - node.Min) / (float)(node.Max - node.Min), 0f, 1f);
+        var draw = ImGui.GetWindowDrawList();
+        var background = hovered || active
+            ? Col(0.24f, 0.27f, 0.32f)
+            : Col(0.18f, 0.20f, 0.24f);
+        var fill = Col(0.20f, 0.62f, 0.88f);
+        var border = Col(0.40f, 0.44f, 0.50f);
+
+        draw.AddRectFilled(pos, pos + size, background, 4f);
+        draw.AddRectFilled(pos, new Vector2(pos.X + width * fractionFilled, pos.Y + size.Y),
+            fill, 4f);
+        draw.AddRect(pos, pos + size, border, 4f);
+
+        var handleX = pos.X + width * fractionFilled;
+        draw.AddCircleFilled(new Vector2(handleX, pos.Y + size.Y * .5f), 6f,
+            Col(0.94f, 0.95f, 0.98f));
+
+        draw.AddText(new Vector2(pos.X + 8f, pos.Y + 4f),
+            Col(0.98f, 0.98f, 1f), label);
+        var valueText = node.Value.ToString();
+        var valueWidth = ImGui.CalcTextSize(valueText).X;
+        draw.AddText(new Vector2(pos.X + width - valueWidth - 8f, pos.Y + 4f),
+            Col(1f, 1f, 1f), valueText);
+
+        return hovered;
+    }
+
+    private void DrawConfiguredStatSlider(
+        string displayName, string statKey, RangeNode<int> node)
+    {
+        bool sliderHovered;
+        if (statKey == "Weapon DPS")
+            sliderHovered = DpsSlider($"##weapon_dps_{displayName}", displayName, node);
+        else
+        {
+            Slider(displayName, node);
+            sliderHovered = ImGui.IsItemHovered();
+        }
+
+        if (!sliderHovered)
+            return;
+
+        ImGui.BeginTooltip();
+        if (statKey == "Weapon DPS")
+            ImGui.Text("Click or drag anywhere on the bar to set the DPS threshold.");
+        ImGui.Text("Set to 0 to ignore this stat.");
+        ImGui.TextDisabled("Threshold = minimum qualifying roll.");
+
+        ImGui.EndTooltip();
+    }
+
     private static void ColorNodeEditor(string label, ColorNode node)
     {
         var c = node.Value;
         var v = new Vector4(c.R / 255f, c.G / 255f, c.B / 255f, c.A / 255f);
-        if (ImGui.ColorEdit4(label, ref v, ImGuiColorEditFlags.AlphaPreviewHalf | ImGuiColorEditFlags.AlphaBar))
+        ImGui.SetNextItemWidth(220f);
+        if (ImGui.ColorEdit4(label, ref v,
+                ImGuiColorEditFlags.NoInputs |
+                ImGuiColorEditFlags.AlphaPreviewHalf |
+                ImGuiColorEditFlags.AlphaBar))
         {
             c.R = (byte)Math.Clamp((int)(v.X * 255f), 0, 255);
             c.G = (byte)Math.Clamp((int)(v.Y * 255f), 0, 255);
