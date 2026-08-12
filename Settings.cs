@@ -123,6 +123,12 @@ public class Settings : ISettings
     [Menu("Item Info - Hold Key for Full Analyzer")]
     public HotkeyNode ItemInfoHotkey { get; set; } = new(Keys.Menu);
 
+    [Menu("Item Info - Show Equipped Items")]
+    public ToggleNode ItemInfoShowEquippedItems { get; set; } = new(true);
+
+    [Menu("Item Info - Minimal Scale")]
+    public RangeNode<int> ItemInfoMinimalScale { get; set; } = new(115, 70, 130);
+
 
 
 
@@ -317,10 +323,10 @@ public class Settings : ISettings
     public RangeNode<int> ItemInfoWidth { get; set; } = new(310, 220, 600);
 
     [Menu("Item Info - Background")]
-    public ColorNode ItemInfoBackground { get; set; } = new(new Color(15, 15, 20, 245));
+    public ColorNode ItemInfoBackground { get; set; } = new(new Color(0, 0, 0, 236));
 
     [Menu("Item Info - Border")]
-    public ColorNode ItemInfoBorder { get; set; } = new(new Color(110, 110, 125, 255));
+    public ColorNode ItemInfoBorder { get; set; } = new(new Color(0, 0, 0, 0));
 
     [Menu("Item Info - Tier Color")]
     public ColorNode ItemInfoTierColor { get; set; } = new(Color.Gold);

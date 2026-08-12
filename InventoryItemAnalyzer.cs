@@ -36,6 +36,17 @@ public partial class InventoryItemAnalyzer : BaseSettingsPlugin<Settings>
     private Entity _lastHoverItem;
     private SharpDX.RectangleF _lastHoverRect;
     private Vector2 _lastHoverMousePosition;
+    private bool _lastHoverWasEquipped;
+    private SharpDX.RectangleF _lastNativeTooltipAnchor;
+    private long _lastNativeTooltipItemAddress;
+
+    // A full stash tab can contain well over one hundred items. Refresh the
+    // rating/geometry snapshot periodically, then draw that inexpensive
+    // snapshot every frame so stash stars remain visible without requiring a
+    // hover or re-analyzing the entire tab at the game's frame rate.
+    private readonly List<StashStarMarker> _visibleStashStars = new();
+    private long _nextStashStarRefreshTicks;
+    private bool _stashStarSnapshotValid;
 
     // Analysis is expensive (modifier/stat parsing). Cache results by item
     // address so Render() only does the expensive work when an item/settings
@@ -60,6 +71,13 @@ public partial class InventoryItemAnalyzer : BaseSettingsPlugin<Settings>
         public int Percentage = -1;
         public int VariableRollCount;
         public int VariableModCount;
+    }
+
+    private sealed class StashStarMarker
+    {
+        public SharpDX.RectangleF Rect;
+        public int Rating;
+        public int SpecialStars;
     }
 
     public override bool Initialise()
@@ -130,6 +148,8 @@ public partial class InventoryItemAnalyzer : BaseSettingsPlugin<Settings>
         try
         {
             var inventoryHandled = false;
+            var inventoryHoverActive = false;
+            long inventoryHoveredItemAddress = 0;
 
             // Existing, known-good inventory path.
             var inventoryPanel = GameController.IngameState.IngameUi.InventoryPanel;
@@ -150,14 +170,20 @@ public partial class InventoryItemAnalyzer : BaseSettingsPlugin<Settings>
                         if (rect.Width <= 0 || rect.Height <= 0)
                             continue;
 
-                        // Stars are part of the analyzer's user-defined rating system.
-                        // Draw them independently of the item-info hotkey.
+                        var mouseOverItem = IsMouseOver(rect);
+                        if (mouseOverItem)
+                        {
+                            inventoryHoverActive = true;
+                            inventoryHoveredItemAddress = unchecked(
+                                (long)inventoryItem.Item.Address);
+                        }
+
                         var starRating = GetCachedRating(inventoryItem.Item);
                         var specialStars = GetCachedSpecialStars(inventoryItem.Item);
                         if (starRating > 0 || specialStars > 0)
                             DrawQualityStars(rect, starRating, specialStars);
 
-                        if (Settings.ShowItemInfo && IsMouseOver(rect) &&
+                        if (Settings.ShowItemInfo && mouseOverItem &&
                             IsItemInfoPopupVisible())
                         {
                             DrawItemInfoOverlay(inventoryItem.Item, rect);
@@ -167,21 +193,35 @@ public partial class InventoryItemAnalyzer : BaseSettingsPlugin<Settings>
                 }
             }
 
+            DrawVisibleStashStars();
+
             if (inventoryHandled || !Settings.ShowItemInfo)
                 return;
 
-            // Equipped items and chat-linked items both surface through
-            // ExileCore's UIHover.HoverItemIcon. This is the same API path
-            // used by AdvancedTooltipPlus and is much more reliable than
-            // walking the UI object graph with reflection.
-            var hover = _hoverItemIcon;
+            // Non-inventory item hovers surface through ExileCore's
+            // UIHover.HoverItemIcon. Read it again during Render so the live
+            // value is preferred while the Tick value remains a safe fallback.
+            var hover = GetLiveHoverItemIcon();
+
+            // An overlay above the inventory can share the same screen
+            // coordinates. Only let the inventory path consume the hover when
+            // UIHover agrees that the inventory entity is active.
+            if (inventoryHoverActive)
+            {
+                var activeHoverItem = hover?.Item;
+                if (activeHoverItem == null || activeHoverItem.Address == 0 ||
+                    unchecked((long)activeHoverItem.Address) ==
+                    inventoryHoveredItemAddress)
+                    return;
+            }
 
             // If Alt/the configured key causes the game's tooltip to rebuild and
-            // UIHover briefly disappears, reuse the last valid equipped/chat item
+            // UIHover briefly disappears, reuse the last valid equipped item
             // for this same key hold.
             if ((hover == null || !hover.IsValid) && IsItemInfoPopupVisible() &&
                 _lastHoverItem != null && _lastHoverItem.IsValid &&
                 _lastHoverItem.GetComponent<Mods>() != null &&
+                (!_lastHoverWasEquipped || Settings.ItemInfoShowEquippedItems.Value) &&
                 IsMouseNear(_lastHoverMousePosition, 12f))
             {
                 DrawItemInfoOverlay(_lastHoverItem, _lastHoverRect);
@@ -191,8 +231,18 @@ public partial class InventoryItemAnalyzer : BaseSettingsPlugin<Settings>
             if (hover == null || !hover.IsValid)
                 return;
 
+            // Chat-linked item hovers expose an invalid Entity pointer in this
+            // ExileAPI build. LootLens intentionally does not analyze them.
+            if (hover.ToolTipType == ToolTipType.ItemInChat)
+            {
+                _lastHoverItem = null;
+                _lastHoverWasEquipped = false;
+                return;
+            }
+
             var hoverItem = hover.Item;
-            var tooltipFrame = hover.ItemFrame;
+            var hasTooltipFrameRect = TryGetHoveredTooltipRect(hover,
+                out var tooltipFrameRect);
 
             // Equipped gear can report ToolTipType.None even though UIHover has
             // a valid item under the cursor. Keep processing the item instead of
@@ -202,32 +252,74 @@ public partial class InventoryItemAnalyzer : BaseSettingsPlugin<Settings>
                 !hoverItem.IsValid || hoverItem.GetComponent<Mods>() == null)
                 return;
 
-            // Inventory is already handled above. UIHover handles equipped
-            // gear and other item contexts (chat/stash/etc.). Equipped items
-            // may not expose a normal ItemFrame, so those use the mouse anchor
-            // fallback below.
-            if (tooltipFrame == null)
+            // ToolTipType is not a reliable equipped-item signal: current
+            // ExileAPI builds can report a normal tooltip type and ItemFrame
+            // for equipped gear. Resolve the actual player equipment slot
+            // containing this entity instead.
+            var equippedHover = TryGetEquippedItemRect(hoverItem,
+                out var equippedItemRect);
+            if (equippedHover && !Settings.ItemInfoShowEquippedItems.Value)
             {
+                _lastHoverItem = null;
+                _lastHoverWasEquipped = false;
+                return;
+            }
+
+            // Resolve the visible source cell independently from the tooltip.
+            // Equipment and stash UI geometry is more reliable than the
+            // generic Item2DIcon pointer in current ExileAPI builds.
+            var stashItemRect = default(SharpDX.RectangleF);
+            var hasStashRect = !equippedHover &&
+                               TryGetStashItemRect(hoverItem,
+                                   out stashItemRect) &&
+                               IsUsableHoveredItemRect(stashItemRect);
+            var hasHoverIconRect = TryGetHoveredItemIconRect(hover,
+                                    out var hoverIconRect) &&
+                                   IsUsableHoveredItemRect(hoverIconRect);
+            var hasEquippedRect = equippedItemRect.Width > 0f &&
+                                  equippedItemRect.Height > 0f &&
+                                  IsUsableHoveredItemRect(equippedItemRect);
+            var hasSourceItemRect = hasEquippedRect || hasStashRect ||
+                                    hasHoverIconRect;
+            var sourceItemRect = hasEquippedRect
+                ? equippedItemRect
+                : hasStashRect
+                    ? stashItemRect
+                    : hoverIconRect;
+
+            // Inventory is already handled above. UIHover handles equipped,
+            // stash, and other item contexts. Equipped items may not expose a
+            // normal ItemFrame, so those use the mouse anchor fallback below.
+            if (!hasTooltipFrameRect)
+            {
+                var sourceRating = GetCachedRating(hoverItem);
+                var sourceSpecialStars = GetCachedSpecialStars(hoverItem);
+                if (hasSourceItemRect &&
+                    (sourceRating > 0 || sourceSpecialStars > 0))
+                {
+                    DrawQualityStars(sourceItemRect, sourceRating,
+                        sourceSpecialStars);
+                }
+
                 if (IsItemInfoPopupVisible())
                 {
                     var mouse = ImGuiNET.ImGui.GetIO().MousePos;
                     var mouseRect = new SharpDX.RectangleF(mouse.X, mouse.Y, 1f, 1f);
+                    var fallbackRect = hasSourceItemRect
+                        ? sourceItemRect
+                        : mouseRect;
 
                     _lastHoverItem = hoverItem;
-                    _lastHoverRect = mouseRect;
+                    _lastHoverRect = fallbackRect;
                     _lastHoverMousePosition = mouse;
+                    _lastHoverWasEquipped = equippedHover;
 
-                    var equippedRating = GetCachedRating(hoverItem);
-                    var equippedSpecialStars = GetCachedSpecialStars(hoverItem);
-                    if (equippedRating > 0 || equippedSpecialStars > 0)
-                        DrawQualityStars(mouseRect, equippedRating, equippedSpecialStars);
-
-                    DrawItemInfoOverlay(hoverItem, mouseRect);
+                    DrawItemInfoOverlay(hoverItem, fallbackRect);
                 }
                 return;
             }
 
-            var hoverRect = tooltipFrame.GetClientRect();
+            var hoverRect = tooltipFrameRect;
 
             if (hoverRect.Width <= 0 || hoverRect.Height <= 0)
             {
@@ -235,8 +327,8 @@ public partial class InventoryItemAnalyzer : BaseSettingsPlugin<Settings>
                 hoverRect = new SharpDX.RectangleF(mouse.X, mouse.Y, 1f, 1f);
             }
 
-            // ItemFrame is the game's tooltip frame in stash/chat contexts,
-            // not the inventory cell beneath the cursor. UIHover has already
+            // ItemFrame is the game's tooltip frame in non-inventory contexts,
+            // not the source cell beneath the cursor. UIHover has already
             // established that this is the hovered item, so testing the mouse
             // against ItemFrame would incorrectly reject stash items.
 
@@ -245,10 +337,21 @@ public partial class InventoryItemAnalyzer : BaseSettingsPlugin<Settings>
             _lastHoverItem = hoverItem;
             _lastHoverRect = hoverRect;
             _lastHoverMousePosition = ImGuiNET.ImGui.GetIO().MousePos;
+            _lastHoverWasEquipped = equippedHover;
 
             var hoverRating = GetCachedRating(hoverItem);
             var hoverSpecialStars = GetCachedSpecialStars(hoverItem);
-            if (hoverRating > 0 || hoverSpecialStars > 0)
+            var attachedHoverAnalyzerVisible = IsItemInfoPopupVisible();
+            if (hasSourceItemRect &&
+                (hoverRating > 0 || hoverSpecialStars > 0))
+            {
+                // Equipped and stash items retain their source-icon rating
+                // even while the attached analyzer is visible.
+                DrawQualityStars(sourceItemRect, hoverRating,
+                    hoverSpecialStars);
+            }
+            else if (!attachedHoverAnalyzerVisible &&
+                (hoverRating > 0 || hoverSpecialStars > 0))
                 DrawQualityStars(hoverRect, hoverRating, hoverSpecialStars);
 
             if (IsItemInfoPopupVisible())
@@ -258,6 +361,7 @@ public partial class InventoryItemAnalyzer : BaseSettingsPlugin<Settings>
             else
             {
                 _lastHoverItem = null;
+                _lastHoverWasEquipped = false;
             }
         }
         catch (Exception ex)
@@ -880,6 +984,9 @@ public partial class InventoryItemAnalyzer : BaseSettingsPlugin<Settings>
             // where the visible mod is correct but the raw key is opaque.
             var readable = GetReadableModText(mod, GetMemberString(mod, "RawName"), values);
             var statKey = key + " " + readable;
+            var isMaximumResistance =
+                Contains(statKey, "Maximum") &&
+                Contains(statKey, "Resistance");
 
             if (value == 0 && values.Count > 0)
                 value = ParseInt(values[0]);
@@ -915,24 +1022,34 @@ public partial class InventoryItemAnalyzer : BaseSettingsPlugin<Settings>
             if (Contains(statKey, "Intelligence") || Contains(statKey, "Int"))
                 s.Intelligence += value;
 
-            if (Contains(statKey, "FireDamageResistancePct") || Contains(statKey, "FireResist") ||
-                Contains(statKey, "Fire Resistance"))
+            if (!isMaximumResistance &&
+                (Contains(statKey, "FireDamageResistancePct") ||
+                 Contains(statKey, "FireResist") ||
+                 Contains(statKey, "Fire Resistance")))
                 s.FireRes += value;
 
-            if (Contains(statKey, "ColdDamageResistancePct") || Contains(statKey, "ColdResist") ||
-                Contains(statKey, "Cold Resistance"))
+            if (!isMaximumResistance &&
+                (Contains(statKey, "ColdDamageResistancePct") ||
+                 Contains(statKey, "ColdResist") ||
+                 Contains(statKey, "Cold Resistance")))
                 s.ColdRes += value;
 
-            if (Contains(statKey, "LightningDamageResistancePct") || Contains(statKey, "LightningResist") ||
-                Contains(statKey, "Lightning Resistance"))
+            if (!isMaximumResistance &&
+                (Contains(statKey, "LightningDamageResistancePct") ||
+                 Contains(statKey, "LightningResist") ||
+                 Contains(statKey, "Lightning Resistance")))
                 s.LightningRes += value;
 
-            if (Contains(statKey, "ChaosDamageResistancePct") || Contains(statKey, "ChaosResist") ||
-                Contains(statKey, "Chaos Resistance"))
+            if (!isMaximumResistance &&
+                (Contains(statKey, "ChaosDamageResistancePct") ||
+                 Contains(statKey, "ChaosResist") ||
+                 Contains(statKey, "Chaos Resistance")))
                 s.ChaosRes += value;
 
-            if (Contains(statKey, "ResistAllElementsPct") || Contains(statKey, "AllResist") ||
-                Contains(statKey, "All Elemental Resistances"))
+            if (!isMaximumResistance &&
+                (Contains(statKey, "ResistAllElementsPct") ||
+                 Contains(statKey, "AllResist") ||
+                 Contains(statKey, "All Elemental Resistances")))
                 s.AllRes += value;
 
             if (Contains(statKey, "MovementVelocityPct") ||
@@ -1337,6 +1454,327 @@ public partial class InventoryItemAnalyzer : BaseSettingsPlugin<Settings>
         var mouse = ImGuiNET.ImGui.GetIO().MousePos;
         return Math.Abs(mouse.X - position.X) <= tolerance &&
                Math.Abs(mouse.Y - position.Y) <= tolerance;
+    }
+
+    private static bool IsUsableHoveredItemRect(SharpDX.RectangleF rect)
+    {
+        if (rect.Width <= 0f || rect.Height <= 0f ||
+            rect.Width > 320f || rect.Height > 320f)
+            return false;
+
+        var mouse = ImGuiNET.ImGui.GetIO().MousePos;
+        const float tolerance = 4f;
+        return mouse.X >= rect.Left - tolerance &&
+               mouse.X <= rect.Right + tolerance &&
+               mouse.Y >= rect.Top - tolerance &&
+               mouse.Y <= rect.Bottom + tolerance;
+    }
+
+    private HoverItemIcon GetLiveHoverItemIcon()
+    {
+        try
+        {
+            var liveHover = GameController?.Game?.IngameState?.UIHover?
+                .AsObject<HoverItemIcon>();
+            if (liveHover != null && liveHover.IsValid)
+            {
+                _hoverItemIcon = liveHover;
+                return liveHover;
+            }
+        }
+        catch
+        {
+        }
+
+        return _hoverItemIcon != null && _hoverItemIcon.IsValid
+            ? _hoverItemIcon
+            : null;
+    }
+
+    private static bool TryGetHoveredTooltipRect(HoverItemIcon hover,
+        out SharpDX.RectangleF tooltipRect)
+    {
+        tooltipRect = default;
+        if (hover == null || !hover.IsValid)
+            return false;
+
+        // ExileAPI uses different tooltip members for inventory, stash,
+        // ground, and equipped items. Reflection keeps this
+        // compatible with builds that do not expose every member.
+        foreach (var memberName in new[]
+                 {
+                     "ItemFrame",
+                     "InventoryItemTooltip",
+                     "Tooltip",
+                     "ToolTipOnGround"
+                 })
+        {
+            var element = GetMemberObject(hover, memberName);
+            if (TryGetElementClientRect(element, out tooltipRect))
+                return true;
+        }
+
+        return false;
+    }
+
+    private static bool TryGetElementClientRect(object element,
+        out SharpDX.RectangleF elementRect)
+    {
+        elementRect = default;
+        if (element == null)
+            return false;
+
+        try
+        {
+            var method = element.GetType().GetMethod("GetClientRect",
+                BindingFlags.Instance | BindingFlags.Public |
+                BindingFlags.NonPublic, null, Type.EmptyTypes, null);
+            var result = method?.Invoke(element, null);
+            if (result is not SharpDX.RectangleF rect ||
+                rect.Width <= 0f || rect.Height <= 0f)
+                return false;
+
+            elementRect = rect;
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private bool TryGetEquippedItemRect(Entity item,
+        out SharpDX.RectangleF itemRect)
+    {
+        itemRect = default;
+        if (item == null || item.Address == 0)
+            return false;
+
+        try
+        {
+            var inventoryPanel = GameController?.IngameState?.IngameUi?
+                .InventoryPanel;
+            if (inventoryPanel == null)
+                return false;
+
+            // InventoryIndex 6 through 18 are the actual equipment slots:
+            // helm, amulet, body, weapons/swaps, rings, gloves, belt and boots.
+            // PlayerInventory begins at 19 and is deliberately excluded.
+            for (var slotIndex = (int)InventoryIndex.Helm;
+                 slotIndex <= (int)InventoryIndex.Boots;
+                 slotIndex++)
+            {
+                try
+                {
+                    var slotInventory = inventoryPanel[(InventoryIndex)slotIndex];
+                    var slotItems = slotInventory?.ServerInventory?
+                        .InventorySlotItems;
+                    if (slotItems == null)
+                        continue;
+
+                    foreach (var slotItem in slotItems)
+                    {
+                        var equippedItem = slotItem?.Item;
+                        if (equippedItem == null ||
+                            equippedItem.Address != item.Address)
+                            continue;
+
+                        // Equipment InventSlotItem.GetClientRect() uses grid
+                        // coordinates and can be projected into the main
+                        // backpack. The slot InventoryUIElement is the real
+                        // visible equipment-cell rectangle.
+                        var inventoryRect = slotInventory.InventoryUIElement?
+                            .GetClientRect() ?? default;
+                        if (inventoryRect.Width > 0f &&
+                            inventoryRect.Height > 0f)
+                        {
+                            itemRect = inventoryRect;
+                        }
+                        else
+                        {
+                            var slotRect = slotItem.GetClientRect();
+                            if (slotRect.Width > 0f && slotRect.Height > 0f)
+                                itemRect = slotRect;
+                        }
+
+                        return true;
+                    }
+                }
+                catch
+                {
+                    // Some optional equipment indices are absent in older
+                    // ExileAPI layouts. Continue checking the remaining slots.
+                }
+            }
+        }
+        catch
+        {
+        }
+
+        return false;
+    }
+
+    private bool TryGetStashItemRect(Entity item,
+        out SharpDX.RectangleF itemRect)
+    {
+        itemRect = default;
+        if (item == null || item.Address == 0)
+            return false;
+
+        try
+        {
+            var stash = GameController?.IngameState?.IngameUi?.StashElement;
+            var stashInventory = stash?.VisibleStash;
+            if (stash == null || !stash.IsVisible || stashInventory == null)
+                return false;
+
+            try
+            {
+                var slotItems = stashInventory.ServerInventory?
+                    .InventorySlotItems;
+                if (slotItems == null)
+                    return false;
+
+                foreach (var slotItem in slotItems)
+                {
+                    var stashItem = slotItem?.Item;
+                    if (stashItem == null || stashItem.Address != item.Address)
+                        continue;
+
+                    var inventoryRect = stashInventory.InventoryUIElement?
+                        .GetClientRect() ?? default;
+                    var columns = stashInventory.TotalBoxesInInventoryRow;
+                    if (inventoryRect.Width > 0f &&
+                        inventoryRect.Height > 0f && columns > 0)
+                    {
+                        var cellSize = inventoryRect.Width / columns;
+                        if (cellSize <= 0f)
+                            continue;
+
+                        itemRect = new SharpDX.RectangleF(
+                            inventoryRect.Left + slotItem.PosX * cellSize,
+                            inventoryRect.Top + slotItem.PosY * cellSize,
+                            Math.Max(cellSize, slotItem.SizeX * cellSize),
+                            Math.Max(cellSize, slotItem.SizeY * cellSize));
+                        return true;
+                    }
+                }
+            }
+            catch
+            {
+            }
+        }
+        catch
+        {
+        }
+
+        return false;
+    }
+
+    private void DrawVisibleStashStars()
+    {
+        try
+        {
+            var stash = GameController?.IngameState?.IngameUi?.StashElement;
+            var stashInventory = stash?.VisibleStash;
+            if (stash == null || !stash.IsVisible || stashInventory == null)
+            {
+                _visibleStashStars.Clear();
+                _stashStarSnapshotValid = false;
+                _nextStashStarRefreshTicks = 0;
+                return;
+            }
+
+            var now = DateTime.UtcNow.Ticks;
+            if (!_stashStarSnapshotValid || now >= _nextStashStarRefreshTicks)
+            {
+                _visibleStashStars.Clear();
+
+                var inventoryRect = stashInventory.InventoryUIElement?
+                    .GetClientRect() ?? default;
+                var columns = stashInventory.TotalBoxesInInventoryRow;
+                var slotItems = stashInventory.ServerInventory?
+                    .InventorySlotItems;
+
+                if (inventoryRect.Width > 0f &&
+                    inventoryRect.Height > 0f && columns > 0 &&
+                    slotItems != null)
+                {
+                    var cellSize = inventoryRect.Width / columns;
+                    if (cellSize > 0f)
+                    {
+                        foreach (var slotItem in slotItems)
+                        {
+                            var stashItem = slotItem?.Item;
+                            if (stashItem == null || stashItem.Address == 0 ||
+                                !stashItem.IsValid ||
+                                stashItem.GetComponent<Mods>() == null)
+                                continue;
+
+                            var rating = GetCachedRating(stashItem);
+                            var specialStars = GetCachedSpecialStars(stashItem);
+                            if (rating <= 0 && specialStars <= 0)
+                                continue;
+
+                            _visibleStashStars.Add(new StashStarMarker
+                            {
+                                Rect = new SharpDX.RectangleF(
+                                    inventoryRect.Left +
+                                    slotItem.PosX * cellSize,
+                                    inventoryRect.Top +
+                                    slotItem.PosY * cellSize,
+                                    Math.Max(cellSize,
+                                        slotItem.SizeX * cellSize),
+                                    Math.Max(cellSize,
+                                        slotItem.SizeY * cellSize)),
+                                Rating = rating,
+                                SpecialStars = specialStars
+                            });
+                        }
+                    }
+                }
+
+                _stashStarSnapshotValid = true;
+                _nextStashStarRefreshTicks = now +
+                    TimeSpan.TicksPerMillisecond * 250;
+            }
+
+            foreach (var marker in _visibleStashStars)
+                DrawQualityStars(marker.Rect, marker.Rating,
+                    marker.SpecialStars);
+        }
+        catch
+        {
+            _visibleStashStars.Clear();
+            _stashStarSnapshotValid = false;
+            _nextStashStarRefreshTicks = 0;
+        }
+    }
+
+    private static bool TryGetHoveredItemIconRect(HoverItemIcon hover,
+        out SharpDX.RectangleF itemRect)
+    {
+        itemRect = default;
+        if (hover == null || !hover.IsValid)
+            return false;
+
+        try
+        {
+            var itemIcon = hover.Item2DIcon;
+            if (itemIcon == null || !itemIcon.IsValid)
+                return false;
+
+            var iconRect = itemIcon.GetClientRect();
+            if (iconRect.Width <= 0f || iconRect.Height <= 0f)
+                return false;
+
+            itemRect = iconRect;
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private List<string> BuildCompactInfoRows(Entity item, Mods mods)
@@ -1766,6 +2204,9 @@ public partial class InventoryItemAnalyzer : BaseSettingsPlugin<Settings>
 
         _analysisSettingsSignature = signature;
         _analysisCache.Clear();
+        _visibleStashStars.Clear();
+        _stashStarSnapshotValid = false;
+        _nextStashStarRefreshTicks = 0;
     }
 
     private long ComputeAnalysisSettingsSignature()
@@ -1785,6 +2226,8 @@ public partial class InventoryItemAnalyzer : BaseSettingsPlugin<Settings>
             Add(Settings.AlwaysShowItemInfo.Value ? 1 : 0);
             Add(Settings.ItemInfoCompactMode.Value ? 1 : 0);
             Add(Settings.ItemInfoDebugMode.Value ? 1 : 0);
+            Add(Settings.ItemInfoShowEquippedItems.Value ? 1 : 0);
+            Add(Settings.ItemInfoMinimalScale.Value);
             Add(Settings.ItemInfoWidth.Value);
 
             Add(Settings.Star_Weapon_DpsMode.Value);
@@ -2032,22 +2475,23 @@ public partial class InventoryItemAnalyzer : BaseSettingsPlugin<Settings>
     {
         try
         {
-            // ArmourScore/EvasionScore/ESScore are the base item values exposed
-            // by the Armour component. Rebuild the item's LOCAL defenses using
-            // PoE's local-defense formula:
-            // (base + local flat) * (1 + quality + local increased).
-            //
-            // Quality is local to the item and applies to its base defenses.
-            double ar = armour.ArmourScore;
-            double ev = armour.EvasionScore;
-            double es = armour.EnergyShieldScore;
+            // ArmourScore/EvasionScore/ESScore are the raw base rolls exposed
+            // by the Armour component. The client stores positive base defence
+            // rolls one point below the value shown by the native tooltip, so
+            // normalise them before applying local modifiers. Since PoE 3.25,
+            // item quality is a separate multiplicative "more" modifier:
+            // (base + local flat) * (1 + local increased) * (1 + quality).
+            double ar = armour.ArmourScore > 0 ? armour.ArmourScore + 1 : 0;
+            double ev = armour.EvasionScore > 0 ? armour.EvasionScore + 1 : 0;
+            double es = armour.EnergyShieldScore > 0 ?
+                armour.EnergyShieldScore + 1 : 0;
 
             var quality = item?.GetComponent<Quality>();
             var qualityPct = quality?.ItemQuality ?? 0;
 
-            double arInc = qualityPct;
-            double evInc = qualityPct;
-            double esInc = qualityPct;
+            double arInc = 0;
+            double evInc = 0;
+            double esInc = 0;
 
             double arFlat = 0;
             double evFlat = 0;
@@ -2155,9 +2599,13 @@ public partial class InventoryItemAnalyzer : BaseSettingsPlugin<Settings>
                 }
             }
 
-            var finalAr = Math.Round((ar + arFlat) * (1.0 + arInc / 100.0));
-            var finalEv = Math.Round((ev + evFlat) * (1.0 + evInc / 100.0));
-            var finalEs = Math.Round((es + esFlat) * (1.0 + esInc / 100.0));
+            var qualityMultiplier = 1.0 + qualityPct / 100.0;
+            var finalAr = Math.Round((ar + arFlat) *
+                                     (1.0 + arInc / 100.0) * qualityMultiplier);
+            var finalEv = Math.Round((ev + evFlat) *
+                                     (1.0 + evInc / 100.0) * qualityMultiplier);
+            var finalEs = Math.Round((es + esFlat) *
+                                     (1.0 + esInc / 100.0) * qualityMultiplier);
 
             return ((int)finalAr, (int)finalEv, (int)finalEs);
         }
@@ -2181,7 +2629,10 @@ public partial class InventoryItemAnalyzer : BaseSettingsPlugin<Settings>
 
             // This follows the actual AdvancedTooltip implementation:
             // Weapon.DamageMin/Max + AttackTime, then local weapon mods.
-            var attacksPerSecond = 1000.0 / weapon.AttackTime;
+            // Match the native tooltip/AdvancedTooltip display path: base APS
+            // is rounded to two decimals, local attack speed is applied, then
+            // final APS is rounded again before DPS is calculated.
+            var attacksPerSecond = Math.Round(1000.0 / weapon.AttackTime, 2);
             double physicalLow = weapon.DamageMin;
             double physicalHigh = weapon.DamageMax;
 
@@ -2283,10 +2734,14 @@ public partial class InventoryItemAnalyzer : BaseSettingsPlugin<Settings>
             if (quality == null)
                 return (0, 0, 0);
 
-            physicalMultiplier += quality.ItemQuality / 100.0;
+            var qualityMultiplier = 1.0 + quality.ItemQuality / 100.0;
 
-            physicalLow = Math.Round(physicalLow * physicalMultiplier);
-            physicalHigh = Math.Round(physicalHigh * physicalMultiplier);
+            physicalLow = Math.Round(physicalLow * physicalMultiplier *
+                                     qualityMultiplier);
+            physicalHigh = Math.Round(physicalHigh * physicalMultiplier *
+                                      qualityMultiplier);
+
+            attacksPerSecond = Math.Round(attacksPerSecond, 2);
 
             var physicalDps = ((physicalLow + physicalHigh) / 2.0) * attacksPerSecond;
 
@@ -2636,6 +3091,91 @@ public partial class InventoryItemAnalyzer : BaseSettingsPlugin<Settings>
         return text.Substring(0, max - 3) + "...";
     }
 
+    private bool TryResolveNativeTooltipAnchor(Entity item,
+        SharpDX.RectangleF fallback, out SharpDX.RectangleF anchor)
+    {
+        anchor = fallback;
+        if (item == null || item.Address == 0)
+            return false;
+
+        var itemAddress = unchecked((long)item.Address);
+
+        try
+        {
+            var hover = GetLiveHoverItemIcon();
+            var hoverItem = hover?.Item;
+            if (hoverItem != null && item != null &&
+                hoverItem.Address == item.Address &&
+                TryGetHoveredTooltipRect(hover, out var frameRect))
+            {
+                if (frameRect.Width > 40f && frameRect.Height > 40f)
+                {
+                    anchor = frameRect;
+                    _lastNativeTooltipAnchor = frameRect;
+                    _lastNativeTooltipItemAddress = itemAddress;
+                    return true;
+                }
+            }
+        }
+        catch
+        {
+        }
+
+        // Non-inventory callers already pass the native ItemFrame rectangle.
+        // Inventory cells and the equipped mouse fallback are much smaller.
+        if (fallback.Width >= 220f && fallback.Height >= 120f)
+        {
+            _lastNativeTooltipAnchor = fallback;
+            _lastNativeTooltipItemAddress = itemAddress;
+            return true;
+        }
+
+        // Pressing Alt can rebuild the native tooltip for a frame and make
+        // UIHover temporarily report only the source cell. Reuse the last
+        // verified frame for this exact item so the full analyzer remains
+        // attached instead of falling back to the retired floating layout.
+        if (_lastNativeTooltipItemAddress == itemAddress &&
+            _lastNativeTooltipAnchor.Width >= 220f &&
+            _lastNativeTooltipAnchor.Height >= 120f)
+        {
+            anchor = _lastNativeTooltipAnchor;
+            return true;
+        }
+
+        return false;
+    }
+
+    private static Vector2 GetAnalyzerPanelPosition(
+        SharpDX.RectangleF anchor, float width, float height, bool attachBelow)
+    {
+        var screen = ImGuiNET.ImGui.GetIO().DisplaySize;
+        const float margin = 4f;
+
+        if (attachBelow)
+        {
+            var attachedX = Math.Clamp(anchor.Left, margin,
+                Math.Max(margin, screen.X - width - margin));
+            var belowY = anchor.Bottom;
+            if (belowY + height <= screen.Y - margin)
+                return new Vector2(attachedX, Math.Max(margin, belowY));
+
+            var aboveY = anchor.Top - height;
+            if (aboveY >= margin)
+                return new Vector2(attachedX, aboveY);
+        }
+
+        var x = anchor.Right + 12f;
+        var y = anchor.Top;
+        if (x + width > screen.X - margin)
+            x = anchor.Left - width - 12f;
+        x = Math.Clamp(x, margin, Math.Max(margin, screen.X - width - margin));
+
+        if (y + height > screen.Y - margin)
+            y = Math.Max(margin, screen.Y - height - margin);
+
+        return new Vector2(x, y);
+    }
+
     private void DrawItemInfoOverlay(Entity item, SharpDX.RectangleF itemRect)
     {
         var mods = item.GetComponent<Mods>();
@@ -2647,25 +3187,32 @@ public partial class InventoryItemAnalyzer : BaseSettingsPlugin<Settings>
             ? BuildDebugRows(item, mods)
             : BuildNormalInfoRows(item, mods);
 
-        var polishedCompact = IsCompactAnalyzerModeActive() &&
+        var compactAnalyzer = IsCompactAnalyzerModeActive() &&
                               !Settings.ItemInfoDebugMode.Value;
+        // LootLens is now attached-only. If the game has not exposed a native
+        // tooltip frame yet, wait for it rather than drawing a detached panel.
+        if (!TryResolveNativeTooltipAnchor(item, itemRect,
+                out var overlayAnchor))
+            return;
+
+        const bool attachedToTooltip = true;
 
         // Compact mode can legitimately return no rows when the item has a
         // rating but no qualifying-stat details to display. Do not create an
         // empty background panel in that case.
-        if (polishedCompact && rows.Count == 0)
+        if (compactAnalyzer && rows.Count == 0)
             return;
 
-        if (polishedCompact)
+        if (compactAnalyzer)
         {
-            DrawPolishedCompactOverlay(itemRect, rows,
-                GetCachedAnalysis(item, mods).Rating);
+            DrawMinimalCompactOverlay(overlayAnchor, rows,
+                GetCachedAnalysis(item, mods).Rating, attachedToTooltip);
             return;
         }
 
         if (!Settings.ItemInfoDebugMode.Value)
         {
-            DrawPolishedFullOverlay(itemRect, rows);
+            DrawMinimalFullOverlay(overlayAnchor, rows, attachedToTooltip);
             return;
         }
 
@@ -2712,6 +3259,8 @@ public partial class InventoryItemAnalyzer : BaseSettingsPlugin<Settings>
             : Math.Max(Settings.ItemInfoWidth.Value,
                 (int)Math.Ceiling(maxWidth + padding * 2f + 12f));
         width = Math.Min(width, 760);
+        if (attachedToTooltip)
+            width = Math.Max(width, overlayAnchor.Width);
 
         var height = padding * 2f;
         foreach (var row in rows)
@@ -2722,19 +3271,15 @@ public partial class InventoryItemAnalyzer : BaseSettingsPlugin<Settings>
                 height += rowStep;
         }
 
-        var screen = ImGuiNET.ImGui.GetIO().DisplaySize;
-        var x = itemRect.Right + 12f;
-        var y = itemRect.Top;
+        var panelPosition = GetAnalyzerPanelPosition(overlayAnchor, width, height,
+            attachedToTooltip);
+        var x = panelPosition.X;
+        var y = panelPosition.Y;
 
-        if (x + width > screen.X)
-            x = itemRect.Left - width - 12f;
-        x = Math.Max(4f, x);
-
-        if (y + height > screen.Y)
-            y = Math.Max(4f, screen.Y - height - 4f);
-
-        var bg = ToImGuiColor(GetColor(Settings.ItemInfoBackground, new Color(15,15,20,255)));
-        var border = ToImGuiColor(GetColor(Settings.ItemInfoBorder, new Color(110,110,125,255)));
+        var bg = ToImGuiColor(GetColor(Settings.ItemInfoBackground,
+            new Color(0, 0, 0, 236)));
+        var border = ToImGuiColor(GetColor(Settings.ItemInfoBorder,
+            new Color(0, 0, 0, 0)));
         var tier = ToImGuiColor(GetColor(Settings.ItemInfoTierColor, Color.Gold));
 
         draw.AddRectFilled(new Vector2(x, y), new Vector2(x + width, y + height), bg, 5f);
@@ -3171,7 +3716,7 @@ public partial class InventoryItemAnalyzer : BaseSettingsPlugin<Settings>
     }
 
     private void DrawPolishedFullOverlay(
-        SharpDX.RectangleF itemRect, List<string> rows)
+        SharpDX.RectangleF itemRect, List<string> rows, bool attachBelow)
     {
         var itemName = "ITEM";
         var rarity = string.Empty;
@@ -3289,7 +3834,6 @@ public partial class InventoryItemAnalyzer : BaseSettingsPlugin<Settings>
         var draw = ImGuiNET.ImGui.GetForegroundDrawList();
         var font = ImGuiNET.ImGui.GetFont();
         var fontSize = ImGuiNET.ImGui.GetFontSize();
-        var screen = ImGuiNET.ImGui.GetIO().DisplaySize;
 
         var longest = ImGuiNET.ImGui.CalcTextSize(itemName.ToUpperInvariant()).X;
         foreach (var mod in modRows)
@@ -3304,6 +3848,8 @@ public partial class InventoryItemAnalyzer : BaseSettingsPlugin<Settings>
         var width = Math.Max(430f,
             Math.Max(Settings.ItemInfoWidth.Value, longest + 145f));
         width = Math.Min(width, 650f);
+        if (attachBelow)
+            width = Math.Max(width, itemRect.Width);
 
         const float headerHeight = 66f;
         const float metaHeight = 28f;
@@ -3325,13 +3871,10 @@ public partial class InventoryItemAnalyzer : BaseSettingsPlugin<Settings>
         if (specialMods.Count > 0)
             height += sectionHeight + specialMods.Count * specialRowHeight;
 
-        var x = itemRect.Right + 12f;
-        var y = itemRect.Top;
-        if (x + width > screen.X)
-            x = itemRect.Left - width - 12f;
-        x = Math.Max(4f, x);
-        if (y + height > screen.Y)
-            y = Math.Max(4f, screen.Y - height - 4f);
+        var panelPosition = GetAnalyzerPanelPosition(itemRect, width, height,
+            attachBelow);
+        var x = panelPosition.X;
+        var y = panelPosition.Y;
 
         var topLeft = new Vector2(x, y);
         var bottomRight = new Vector2(x + width, y + height);
@@ -3652,6 +4195,8 @@ public partial class InventoryItemAnalyzer : BaseSettingsPlugin<Settings>
             return ToImGuiColor(new Color(90, 170, 245, 255));
         if (string.Equals(tier, "C", StringComparison.OrdinalIgnoreCase))
             return ToImGuiColor(new Color(90, 210, 225, 255));
+        if (string.Equals(tier, "I", StringComparison.OrdinalIgnoreCase))
+            return ToImGuiColor(new Color(195, 160, 85, 255));
         return ToImGuiColor(new Color(155, 157, 166, 255));
     }
 
@@ -3670,7 +4215,8 @@ public partial class InventoryItemAnalyzer : BaseSettingsPlugin<Settings>
     }
 
     private void DrawPolishedCompactOverlay(
-        SharpDX.RectangleF itemRect, List<string> rows, int rating)
+        SharpDX.RectangleF itemRect, List<string> rows, int rating,
+        bool attachBelow)
     {
         var details = new List<string>();
         var specialMods = new List<string>();
@@ -3710,7 +4256,6 @@ public partial class InventoryItemAnalyzer : BaseSettingsPlugin<Settings>
         var draw = ImGuiNET.ImGui.GetForegroundDrawList();
         var font = ImGuiNET.ImGui.GetFont();
         var fontSize = ImGuiNET.ImGui.GetFontSize();
-        var screen = ImGuiNET.ImGui.GetIO().DisplaySize;
 
         var longestLabel = 0f;
         foreach (var detail in details)
@@ -3726,6 +4271,8 @@ public partial class InventoryItemAnalyzer : BaseSettingsPlugin<Settings>
         var width = Math.Max(340f, Math.Max(Settings.ItemInfoWidth.Value + 30f,
             longestLabel + 188f));
         width = Math.Min(width, 520f);
+        if (attachBelow)
+            width = Math.Max(width, itemRect.Width);
 
         const float headerHeight = 58f;
         const float sectionHeight = 24f;
@@ -3742,13 +4289,10 @@ public partial class InventoryItemAnalyzer : BaseSettingsPlugin<Settings>
         if (specialMods.Count > 0)
             height += sectionHeight + specialMods.Count * specialRowHeight;
 
-        var x = itemRect.Right + 12f;
-        var y = itemRect.Top;
-        if (x + width > screen.X)
-            x = itemRect.Left - width - 12f;
-        x = Math.Max(4f, x);
-        if (y + height > screen.Y)
-            y = Math.Max(4f, screen.Y - height - 4f);
+        var panelPosition = GetAnalyzerPanelPosition(itemRect, width, height,
+            attachBelow);
+        var x = panelPosition.X;
+        var y = panelPosition.Y;
 
         var topLeft = new Vector2(x, y);
         var bottomRight = new Vector2(x + width, y + height);
@@ -3931,6 +4475,938 @@ public partial class InventoryItemAnalyzer : BaseSettingsPlugin<Settings>
                 draw.AddText(font, fontSize * .86f,
                     new Vector2(x + 37f, rowY + 4f), red,
                     specialMods[index].ToUpperInvariant());
+            }
+        }
+
+        draw.PopClipRect();
+    }
+
+    private float GetMinimalUiScale()
+    {
+        return Math.Clamp(Settings.ItemInfoMinimalScale.Value / 100f, .70f, 1.30f);
+    }
+
+    private void DrawMinimalCardBackground(ImGuiNET.ImDrawListPtr draw,
+        Vector2 topLeft, Vector2 bottomRight, bool attached)
+    {
+        var configuredBackground = GetColor(Settings.ItemInfoBackground,
+            new Color(0, 0, 0, 236));
+        var configuredBorder = GetColor(Settings.ItemInfoBorder,
+            new Color(0, 0, 0, 0));
+        // Respect the configured RGBA values exactly. The old implementation
+        // forced a visible alpha onto the border even when the user selected a
+        // fully transparent border.
+        var background = ToImGuiColor(configuredBackground);
+        var border = ToImGuiColor(configuredBorder);
+        var shadow = ToImGuiColor(new Color(0, 0, 0, 135));
+        var rounding = attached ? 1f : 7f;
+
+        if (!attached)
+        {
+            draw.AddRectFilled(topLeft + new Vector2(3f, 4f),
+                bottomRight + new Vector2(3f, 4f), shadow, rounding);
+            draw.AddRectFilled(topLeft, bottomRight, background, rounding);
+            if (configuredBorder.A > 0)
+                draw.AddRect(topLeft, bottomRight, border, rounding,
+                    ImGuiNET.ImDrawFlags.None, 1f);
+            return;
+        }
+
+        // Keep the attached strip seamless. A transparent configured border
+        // now truly means no outer frame.
+        draw.AddRectFilled(topLeft, bottomRight, background, rounding);
+        if (configuredBorder.A > 0)
+        {
+            draw.AddLine(topLeft, new Vector2(topLeft.X, bottomRight.Y), border, 1f);
+            draw.AddLine(new Vector2(topLeft.X, bottomRight.Y), bottomRight, border, 1f);
+            draw.AddLine(new Vector2(bottomRight.X, topLeft.Y), bottomRight, border, 1f);
+        }
+    }
+
+    private static string GetMinimalQualifierLabel(string label)
+    {
+        if (string.IsNullOrWhiteSpace(label))
+            return string.Empty;
+
+        return label.Trim() switch
+        {
+            "Cold Resistance" => "Cold Res",
+            "Fire Resistance" => "Fire Res",
+            "Lightning Resistance" => "Lightning Res",
+            "Chaos Resistance" => "Chaos Res",
+            "Movement Speed" => "Move Speed",
+            "Spell Suppression" => "Suppression",
+            "Critical Strike Chance" => "Crit Chance",
+            "Crit Multiplier" => "Crit Multi",
+            "Cooldown Recovery" => "Cooldown",
+            "Energy Shield" => "Energy Shield",
+            _ => label.Trim()
+        };
+    }
+
+    private static string GetAttachedQualifierLabel(string label, bool narrow)
+    {
+        if (string.IsNullOrWhiteSpace(label))
+            return string.Empty;
+
+        if (narrow)
+        {
+            return label.Trim() switch
+            {
+                "Cold Resistance" => "Cold Res",
+                "Fire Resistance" => "Fire Res",
+                "Lightning Resistance" => "Ltng Res",
+                "Chaos Resistance" => "Chaos Res",
+                "Movement Speed" => "Move Speed",
+                "Spell Suppression" => "Suppress",
+                "Critical Strike Chance" => "Crit Chance",
+                "Crit Multiplier" => "Crit Multi",
+                "Attack Speed" => "Atk Speed",
+                "Cast Speed" => "Cast Speed",
+                "Cooldown Recovery" => "Cooldown",
+                "Energy Shield" => "ES",
+                "Total Weapon DPS" => "Weapon DPS",
+                "Physical DPS" => "Phys DPS",
+                _ => label.Trim()
+            };
+        }
+
+        return label.Trim() switch
+        {
+            "Cold Resistance" => "Cold Res",
+            "Fire Resistance" => "Fire Res",
+            "Lightning Resistance" => "Lightning Res",
+            "Chaos Resistance" => "Chaos Res",
+            "Movement Speed" => "Move Speed",
+            "Spell Suppression" => "Suppression",
+            "Critical Strike Chance" => "Crit Chance",
+            "Crit Multiplier" => "Crit Multi",
+            "Attack Speed" => "Atk Speed",
+            "Cast Speed" => "Cast Speed",
+            "Cooldown Recovery" => "Cooldown",
+            "Energy Shield" => "Energy Shield",
+            "Total Weapon DPS" => "Weapon DPS",
+            "Physical DPS" => "Phys DPS",
+            _ => label.Trim()
+        };
+    }
+
+    private static string GetMinimalMetaText(IEnumerable<string> metaParts)
+    {
+        var parts = new List<string>();
+        foreach (var raw in metaParts ?? Array.Empty<string>())
+        {
+            if (string.IsNullOrWhiteSpace(raw))
+                continue;
+
+            var split = raw.Replace(" | ", "|", StringComparison.Ordinal)
+                .Split('|', StringSplitOptions.RemoveEmptyEntries);
+            foreach (var value in split)
+            {
+                var part = value.Trim()
+                    .Replace(" Prefixes", "P", StringComparison.OrdinalIgnoreCase)
+                    .Replace(" Suffixes", "S", StringComparison.OrdinalIgnoreCase)
+                    .Replace("ilvl ", "i", StringComparison.OrdinalIgnoreCase)
+                    .Replace("Armour ", "AR ", StringComparison.OrdinalIgnoreCase)
+                    .Replace("Evasion ", "EV ", StringComparison.OrdinalIgnoreCase)
+                    .Replace("Energy Shield ", "ES ", StringComparison.OrdinalIgnoreCase);
+                if (!string.IsNullOrWhiteSpace(part))
+                    parts.Add(part);
+            }
+        }
+
+        return string.Join(" · ", parts);
+    }
+
+    private static string EllipsizeMinimalText(string text, float maxWidth,
+        float scale)
+    {
+        text ??= string.Empty;
+        if (maxWidth <= 12f)
+            return string.Empty;
+
+        float Measure(string value) =>
+            ImGuiNET.ImGui.CalcTextSize(value).X * Math.Max(.1f, scale);
+
+        if (Measure(text) <= maxWidth)
+            return text;
+
+        const string ellipsis = "...";
+        var low = 0;
+        var high = text.Length;
+        while (low < high)
+        {
+            var mid = (low + high + 1) / 2;
+            if (Measure(text.Substring(0, mid).TrimEnd() + ellipsis) <= maxWidth)
+                low = mid;
+            else
+                high = mid - 1;
+        }
+
+        return text.Substring(0, Math.Max(0, low)).TrimEnd() + ellipsis;
+    }
+
+    private static void DrawMinimalBadge(ImGuiNET.ImDrawListPtr draw,
+        ImGuiNET.ImFontPtr font, float fontSize, Vector2 position,
+        string text, uint color, float width, float height)
+    {
+        draw.AddRectFilled(position, position + new Vector2(width, height),
+            ToImGuiColor(new Color(24, 25, 30, 238)), 3f);
+        draw.AddRect(position, position + new Vector2(width, height), color, 3f,
+            ImGuiNET.ImDrawFlags.None, 1f);
+        var textWidth = ImGuiNET.ImGui.CalcTextSize(text).X *
+                        (fontSize / Math.Max(1f, ImGuiNET.ImGui.GetFontSize()));
+        draw.AddText(font, fontSize,
+            position + new Vector2(Math.Max(2f, (width - textWidth) * .5f), 2f),
+            color, text);
+    }
+
+    private void DrawMinimalAttachedCompactStrip(SharpDX.RectangleF itemRect,
+        List<string> details, List<string> specialMods, int rating,
+        int uniquePerfection, int uniqueRollCount, int uniqueModCount)
+    {
+        var scale = GetMinimalUiScale();
+        var draw = ImGuiNET.ImGui.GetForegroundDrawList();
+        var font = ImGuiNET.ImGui.GetFont();
+        var baseFontSize = ImGuiNET.ImGui.GetFontSize();
+        var width = Math.Max(250f, itemRect.Width);
+        var gold = ToImGuiColor(GetColor(Settings.ItemInfoTierColor,
+            new Color(235, 190, 45, 255)));
+        var normal = ToImGuiColor(new Color(232, 233, 236, 255));
+        var subdued = ToImGuiColor(new Color(145, 149, 158, 255));
+        // Jewelry tooltips vary in width depending on the base name and the
+        // native modifier text. Keep compact labels available for the wider
+        // ring/amulet variants too; the actual column count is decided below
+        // from the space available rather than from one width cutoff.
+        var narrowAttachedLayout = width < 540f;
+
+        if (uniquePerfection >= 0)
+        {
+            var uniqueStripHeight = 43f * scale;
+            var pos = GetAnalyzerPanelPosition(itemRect, width,
+                uniqueStripHeight, true);
+            var topLeft = pos;
+            var bottomRight = pos + new Vector2(width, uniqueStripHeight);
+            DrawMinimalCardBackground(draw, topLeft, bottomRight, true);
+            draw.PushClipRect(topLeft + Vector2.One,
+                bottomRight - Vector2.One, true);
+
+            var label = "ITEM PERFECTION";
+            draw.AddText(font, baseFontSize * .68f * scale,
+                new Vector2(pos.X + 12f * scale, pos.Y + 7f * scale),
+                subdued, label);
+
+            var rollText = $"{FormatCountLabel(uniqueRollCount, "ROLL", "ROLLS")} · " +
+                           FormatCountLabel(uniqueModCount, "MOD", "MODS");
+            draw.AddText(font, baseFontSize * .56f * scale,
+                new Vector2(pos.X + 12f * scale, pos.Y + 24f * scale),
+                subdued, rollText);
+
+            draw.AddLine(new Vector2(topLeft.X, topLeft.Y + .5f),
+                new Vector2(bottomRight.X, topLeft.Y + .5f),
+                ToImGuiColor(new Color(178, 180, 186, 45)), 1f);
+
+            var percent = $"{uniquePerfection}%";
+            var percentWidth = ImGuiNET.ImGui.CalcTextSize(percent).X *
+                               .86f * scale;
+            var percentX = pos.X + width - 12f * scale - percentWidth;
+            draw.AddText(font, baseFontSize * .86f * scale,
+                new Vector2(percentX, pos.Y + 12f * scale),
+                GetPerfectionColor(uniquePerfection), percent);
+
+            var barLeft = pos.X + 130f * scale;
+            var barRight = percentX - 12f * scale;
+            if (barRight > barLeft + 30f * scale)
+            {
+                var barTop = pos.Y + 19f * scale;
+                var barHeight = 5f * scale;
+                draw.AddRectFilled(new Vector2(barLeft, barTop),
+                    new Vector2(barRight, barTop + barHeight),
+                    ToImGuiColor(new Color(50, 52, 59, 255)), 2f * scale);
+                draw.AddRectFilled(new Vector2(barLeft, barTop),
+                    new Vector2(barLeft + (barRight - barLeft) *
+                        Math.Clamp(uniquePerfection / 100f, 0f, 1f),
+                        barTop + barHeight),
+                    GetPerfectionColor(uniquePerfection), 2f * scale);
+            }
+
+            draw.PopClipRect();
+            return;
+        }
+
+        var qualifiers = new List<(string Label, string Actual,
+            string Required, string Suffix, uint Color)>();
+        foreach (var detail in details)
+        {
+            if (!TryParseCompactDetail(detail, out var label,
+                    out var actual, out var required, out var suffix))
+                continue;
+
+            qualifiers.Add((GetAttachedQualifierLabel(label,
+                    narrowAttachedLayout), actual,
+                required, suffix, GetCompactStatColor(label)));
+        }
+
+        var cellCount = qualifiers.Count + specialMods.Count;
+        if (cellCount == 0)
+            return;
+
+        // Scale the text for readability, but only gently scale the layout.
+        // Otherwise a larger UI scale makes three useful stats wrap even when
+        // the native tooltip has plenty of horizontal room.
+        var layoutScale = 1f + (scale - 1f) * .25f;
+        // Reserve a distinct rating lane so stars never compete with the last
+        // qualifier value or its threshold.
+        var scoreWidth = 70f * layoutScale;
+        var leftPadding = 10f * layoutScale;
+        var rightPadding = 7f * layoutScale;
+        var contentWidth = Math.Max(80f,
+            width - leftPadding - rightPadding - scoreWidth);
+        var maximumColumns = Math.Min(3, cellCount);
+        // A two-line compact cell remains readable at 96 px. Use that as the
+        // true fit requirement for every tooltip, then let wide armour and
+        // weapon cards naturally receive larger cells from contentWidth.
+        var minimumCellWidth = 96f;
+        var columns = Math.Clamp((int)Math.Floor(contentWidth /
+            minimumCellWidth),
+            1, maximumColumns);
+        var rowCount = (int)Math.Ceiling(cellCount / (double)columns);
+        var rowHeight = 38f * scale;
+        var verticalPadding = 7f * layoutScale;
+        var qualifierStripHeight = Math.Max(50f * scale,
+            verticalPadding * 2f + rowCount * rowHeight);
+        var panelPos = GetAnalyzerPanelPosition(itemRect, width,
+            qualifierStripHeight, true);
+        var panelTopLeft = panelPos;
+        var panelBottomRight = panelPos +
+                               new Vector2(width, qualifierStripHeight);
+        DrawMinimalCardBackground(draw, panelTopLeft, panelBottomRight, true);
+        draw.PushClipRect(panelTopLeft + Vector2.One,
+            panelBottomRight - Vector2.One, true);
+
+        // A restrained joining line gives the strip a crisp top edge without
+        // bringing back an outer box. Internal separators are deliberately
+        // faint so the stat colors remain the primary structure.
+        var topSeparator = ToImGuiColor(new Color(178, 180, 186, 45));
+        var internalSeparator = ToImGuiColor(new Color(125, 128, 136, 34));
+        draw.AddLine(new Vector2(panelTopLeft.X, panelTopLeft.Y + .5f),
+            new Vector2(panelBottomRight.X, panelTopLeft.Y + .5f),
+            topSeparator, 1f);
+
+        var cellWidth = contentWidth / columns;
+        var contentLeft = panelPos.X + leftPadding;
+        var contentTop = panelPos.Y + verticalPadding;
+        var contentBottom = contentTop + rowCount * rowHeight;
+        for (var divider = 1; divider < columns; divider++)
+        {
+            var dividerX = contentLeft + divider * cellWidth;
+            draw.AddLine(new Vector2(dividerX, contentTop + 3f * layoutScale),
+                new Vector2(dividerX,
+                    Math.Min(contentBottom - 3f * layoutScale,
+                        panelBottomRight.Y - 6f * layoutScale)),
+                internalSeparator, 1f);
+        }
+        for (var rowDivider = 1; rowDivider < rowCount; rowDivider++)
+        {
+            var dividerY = contentTop + rowDivider * rowHeight;
+            draw.AddLine(new Vector2(contentLeft + 5f * layoutScale, dividerY),
+                new Vector2(contentLeft + contentWidth - 5f * layoutScale,
+                    dividerY), internalSeparator, 1f);
+        }
+
+        var scoreDividerX = panelPos.X + width - rightPadding - scoreWidth;
+        draw.AddLine(new Vector2(scoreDividerX,
+                panelTopLeft.Y + 8f * layoutScale),
+            new Vector2(scoreDividerX,
+                panelBottomRight.Y - 8f * layoutScale),
+            internalSeparator, 1f);
+
+        var cellIndex = 0;
+        foreach (var qualifier in qualifiers)
+        {
+            var column = cellIndex % columns;
+            var row = cellIndex / columns;
+            var cellX = panelPos.X + leftPadding + column * cellWidth;
+            var rowY = panelPos.Y + verticalPadding + row * rowHeight;
+            draw.AddRectFilled(new Vector2(cellX, rowY + 3f * layoutScale),
+                new Vector2(cellX + 2f * scale,
+                    rowY + rowHeight - 3f * layoutScale), qualifier.Color, 1f);
+
+            var labelWidth = Math.Max(20f, cellWidth - 18f * layoutScale);
+            var label = EllipsizeMinimalText(
+                qualifier.Label.ToUpperInvariant(), labelWidth, .66f * scale);
+            draw.AddText(font, baseFontSize * .66f * scale,
+                new Vector2(cellX + 8f * layoutScale, rowY + 1f * scale),
+                qualifier.Color, label);
+
+            var actualText = $"{qualifier.Actual}{qualifier.Suffix}";
+            var minimumText = $"MIN {qualifier.Required}{qualifier.Suffix}";
+            var minimumWidth = ImGuiNET.ImGui.CalcTextSize(minimumText).X *
+                               .52f * scale;
+            draw.AddText(font, baseFontSize * .84f * scale,
+                new Vector2(cellX + 8f * layoutScale, rowY + 17f * scale),
+                normal, actualText);
+            draw.AddText(font, baseFontSize * .52f * scale,
+                new Vector2(cellX + cellWidth - 8f * layoutScale - minimumWidth,
+                    rowY + 21f * scale), subdued, minimumText);
+            cellIndex++;
+        }
+
+        var specialColor = ToImGuiColor(Settings.SpecialStarColor.Value);
+        foreach (var special in specialMods)
+        {
+            var column = cellIndex % columns;
+            var row = cellIndex / columns;
+            var cellX = panelPos.X + leftPadding + column * cellWidth;
+            var rowY = panelPos.Y + verticalPadding + row * rowHeight;
+            draw.AddRectFilled(new Vector2(cellX, rowY + 3f * layoutScale),
+                new Vector2(cellX + 2f * scale,
+                    rowY + rowHeight - 3f * layoutScale), specialColor, 1f);
+            var text = EllipsizeMinimalText(special.ToUpperInvariant(),
+                cellWidth - 18f * layoutScale, .64f * scale);
+            draw.AddText(font, baseFontSize * .64f * scale,
+                new Vector2(cellX + 8f * layoutScale, rowY + 1f * scale),
+                specialColor, text);
+            DrawFivePointStar(draw,
+                new Vector2(cellX + 11f * layoutScale, rowY + 27f * scale),
+                4.2f * scale, specialColor);
+            draw.AddText(font, baseFontSize * .52f * scale,
+                new Vector2(cellX + 20f * layoutScale, rowY + 21f * scale),
+                subdued, "SPECIAL MOD");
+            cellIndex++;
+        }
+
+        var starSpacing = 16f * scale;
+        var starLaneCenter = scoreDividerX + scoreWidth * .5f;
+        var starStart = starLaneCenter - starSpacing;
+        var starY = panelPos.Y + qualifierStripHeight * .5f;
+        for (var star = 0; star < 3; star++)
+        {
+            var center = new Vector2(starStart + star * starSpacing, starY);
+            if (star < Math.Clamp(rating, 0, 3))
+                DrawFivePointStar(draw, center, 5.4f * scale, gold);
+            else
+                DrawFivePointStarOutline(draw, center, 5.4f * scale,
+                    ToImGuiColor(new Color(100, 103, 112, 255)));
+        }
+
+        draw.PopClipRect();
+    }
+
+    private void DrawMinimalCompactOverlay(SharpDX.RectangleF itemRect,
+        List<string> rows, int rating, bool attachBelow)
+    {
+        var details = new List<string>();
+        var specialMods = new List<string>();
+        var uniquePerfection = -1;
+        var uniqueRollCount = 0;
+        var uniqueModCount = 0;
+
+        foreach (var raw in rows)
+        {
+            if (raw.StartsWith("UNIQUE PERFECTION|", StringComparison.Ordinal))
+            {
+                var parts = raw.Substring("UNIQUE PERFECTION|".Length).Split('|');
+                if (parts.Length > 0) int.TryParse(parts[0], out uniquePerfection);
+                if (parts.Length > 1) int.TryParse(parts[1], out uniqueRollCount);
+                if (parts.Length > 2) int.TryParse(parts[2], out uniqueModCount);
+            }
+            else if (raw.StartsWith("DETAIL|", StringComparison.Ordinal))
+            {
+                var detail = raw.Substring("DETAIL|".Length).Trim();
+                if (!string.Equals(detail, "QUALIFYING STATS", StringComparison.Ordinal) &&
+                    !string.IsNullOrWhiteSpace(detail))
+                    details.Add(detail);
+            }
+            else if (raw.StartsWith("SPECIAL|", StringComparison.Ordinal))
+            {
+                var special = raw.Substring("SPECIAL|".Length).Trim();
+                if (!string.IsNullOrWhiteSpace(special))
+                    specialMods.Add(special);
+            }
+        }
+
+        if (details.Count == 0 && specialMods.Count == 0 && uniquePerfection < 0)
+            return;
+
+        if (attachBelow)
+        {
+            DrawMinimalAttachedCompactStrip(itemRect, details, specialMods,
+                rating, uniquePerfection, uniqueRollCount, uniqueModCount);
+            return;
+        }
+
+        var scale = GetMinimalUiScale();
+        var draw = ImGuiNET.ImGui.GetForegroundDrawList();
+        var font = ImGuiNET.ImGui.GetFont();
+        var baseFontSize = ImGuiNET.ImGui.GetFontSize();
+        var width = attachBelow
+            ? Math.Max(230f * scale, itemRect.Width)
+            : Math.Max(250f * scale, Math.Min(360f * scale,
+                Settings.ItemInfoWidth.Value * scale));
+        var headerHeight = 30f * scale;
+        var rowHeight = 23f * scale;
+        var specialRowHeight = 20f * scale;
+        var uniqueHeight = uniquePerfection >= 0 ? 35f * scale : 0f;
+        var height = 8f * scale + headerHeight + uniqueHeight +
+                     details.Count * rowHeight + specialMods.Count * specialRowHeight;
+
+        var pos = GetAnalyzerPanelPosition(itemRect, width, height, attachBelow);
+        var x = pos.X;
+        var y = pos.Y;
+        var topLeft = new Vector2(x, y);
+        var bottomRight = new Vector2(x + width, y + height);
+        DrawMinimalCardBackground(draw, topLeft, bottomRight, attachBelow);
+        draw.PushClipRect(topLeft + Vector2.One,
+            bottomRight - Vector2.One, true);
+
+        var normal = ToImGuiColor(new Color(232, 233, 236, 255));
+        var subdued = ToImGuiColor(new Color(145, 149, 158, 255));
+        var gold = ToImGuiColor(GetColor(Settings.ItemInfoTierColor,
+            new Color(235, 190, 45, 255)));
+        var cy = y + 8f * scale;
+
+        var headerText = uniquePerfection >= 0
+            ? "ITEM PERFECTION"
+            : details.Count > 0 ? $"{details.Count} MATCHES" : "SPECIAL MODS";
+        draw.AddText(font, baseFontSize * .76f * scale,
+            new Vector2(x + 11f * scale, cy), subdued, headerText);
+
+        if (uniquePerfection >= 0)
+        {
+            var percent = $"{uniquePerfection}%";
+            var percentWidth = ImGuiNET.ImGui.CalcTextSize(percent).X * .90f * scale;
+            draw.AddText(font, baseFontSize * .90f * scale,
+                new Vector2(x + width - 11f * scale - percentWidth, cy - 1f * scale),
+                GetPerfectionColor(uniquePerfection), percent);
+        }
+        else if (rating > 0)
+        {
+            var starStart = x + width - 53f * scale;
+            for (var star = 0; star < 3; star++)
+            {
+                var center = new Vector2(starStart + star * 16f * scale,
+                    cy + 7f * scale);
+                if (star < Math.Clamp(rating, 0, 3))
+                    DrawFivePointStar(draw, center, 5.4f * scale, gold);
+                else
+                    DrawFivePointStarOutline(draw, center, 5.4f * scale,
+                        ToImGuiColor(new Color(100, 103, 112, 255)));
+            }
+        }
+
+        cy += headerHeight;
+        if (uniquePerfection >= 0)
+        {
+            var barLeft = x + 11f * scale;
+            var barRight = x + width - 11f * scale;
+            var barTop = cy + 1f * scale;
+            var barHeight = 6f * scale;
+            draw.AddRectFilled(new Vector2(barLeft, barTop),
+                new Vector2(barRight, barTop + barHeight),
+                ToImGuiColor(new Color(50, 52, 59, 255)), 3f * scale);
+            draw.AddRectFilled(new Vector2(barLeft, barTop),
+                new Vector2(barLeft + (barRight - barLeft) *
+                    Math.Clamp(uniquePerfection / 100f, 0f, 1f), barTop + barHeight),
+                GetPerfectionColor(uniquePerfection), 3f * scale);
+            var rollText = $"{FormatCountLabel(uniqueRollCount, "VARIABLE ROLL", "VARIABLE ROLLS")} · " +
+                           $"{FormatCountLabel(uniqueModCount, "MODIFIER", "MODIFIERS")} · FIXED EXCLUDED";
+            rollText = EllipsizeMinimalText(rollText,
+                barRight - barLeft, .62f * scale);
+            draw.AddText(font, baseFontSize * .62f * scale,
+                new Vector2(barLeft, barTop + 10f * scale), subdued, rollText);
+            cy += uniqueHeight;
+        }
+
+        for (var index = 0; index < details.Count; index++)
+        {
+            if (!TryParseCompactDetail(details[index], out var label,
+                    out var actualValue, out var requiredValue, out var suffix))
+                continue;
+
+            var rowTop = cy + index * rowHeight;
+            var statColor = GetCompactStatColor(label);
+            draw.AddRectFilled(new Vector2(x + 11f * scale, rowTop + 4f * scale),
+                new Vector2(x + 13f * scale, rowTop + rowHeight - 4f * scale),
+                statColor, 1f);
+            var minimalLabel = GetMinimalQualifierLabel(label);
+            draw.AddText(font, baseFontSize * .76f * scale,
+                new Vector2(x + 20f * scale, rowTop + 3f * scale), normal,
+                minimalLabel);
+
+            var valueText = $"{actualValue}{suffix} >= {requiredValue}{suffix}";
+            var valueSize = baseFontSize * .73f * scale;
+            var valueWidth = ImGuiNET.ImGui.CalcTextSize(valueText).X * .73f * scale;
+            draw.AddText(font, valueSize,
+                new Vector2(x + width - 11f * scale - valueWidth,
+                    rowTop + 3f * scale), subdued, valueText);
+        }
+        cy += details.Count * rowHeight;
+
+        var specialColor = ToImGuiColor(Settings.SpecialStarColor.Value);
+        for (var index = 0; index < specialMods.Count; index++)
+        {
+            var rowTop = cy + index * specialRowHeight;
+            DrawFivePointStar(draw, new Vector2(x + 13f * scale,
+                    rowTop + 8f * scale), 4.2f * scale, specialColor);
+            var text = EllipsizeMinimalText(specialMods[index].ToUpperInvariant(),
+                width - 35f * scale, .72f * scale);
+            draw.AddText(font, baseFontSize * .72f * scale,
+                new Vector2(x + 22f * scale, rowTop + 1f * scale),
+                specialColor, text);
+        }
+
+        draw.PopClipRect();
+    }
+
+    private void DrawMinimalFullOverlay(SharpDX.RectangleF itemRect,
+        List<string> rows, bool attachBelow)
+    {
+        var itemName = "ITEM";
+        var rarity = string.Empty;
+        var rating = 0;
+        var uniquePerfection = -1;
+        var uniqueRollCount = 0;
+        var uniqueModCount = 0;
+        var metaParts = new List<string>();
+        var modRows = new List<(string Affix, string Tier, string Text)>();
+        var details = new List<string>();
+        var specialMods = new List<string>();
+
+        foreach (var raw in rows)
+        {
+            if (string.IsNullOrWhiteSpace(raw))
+                continue;
+            if (raw.StartsWith("HEADER|", StringComparison.Ordinal))
+            {
+                var parts = raw.Substring("HEADER|".Length).Split('|');
+                if (parts.Length > 0 && !string.IsNullOrWhiteSpace(parts[0]))
+                    itemName = parts[0].Trim();
+                if (parts.Length > 1) rarity = parts[1].Trim();
+                if (parts.Length > 2) int.TryParse(parts[2], out rating);
+            }
+            else if (raw.StartsWith("META|", StringComparison.Ordinal))
+                metaParts.Add(raw.Substring("META|".Length));
+            else if (raw.StartsWith("DEFENSES|", StringComparison.Ordinal))
+                metaParts.Add(raw.Substring("DEFENSES|".Length)
+                    .Replace("  •  ", " | ", StringComparison.Ordinal));
+            else if (raw.StartsWith("DPSROW|", StringComparison.Ordinal))
+                metaParts.Add(raw.Substring("DPSROW|".Length)
+                    .Replace("|", " | ", StringComparison.Ordinal));
+            else if (raw.StartsWith("MODROW|", StringComparison.Ordinal))
+            {
+                var parts = raw.Substring("MODROW|".Length).Split('|');
+                var affix = parts.Length > 0 ? parts[0].Trim() : string.Empty;
+                var tier = parts.Length > 1 ? parts[1].Trim() : string.Empty;
+                var text = parts.Length > 2
+                    ? string.Join("/", parts.Skip(2)).Trim()
+                    : string.Empty;
+                if (!string.IsNullOrWhiteSpace(text))
+                    modRows.Add((affix, tier, text));
+            }
+            else if (raw.StartsWith("LOOT RATING|", StringComparison.Ordinal))
+                int.TryParse(raw.Substring("LOOT RATING|".Length), out rating);
+            else if (raw.StartsWith("UNIQUE PERFECTION|", StringComparison.Ordinal))
+            {
+                var parts = raw.Substring("UNIQUE PERFECTION|".Length).Split('|');
+                if (parts.Length > 0) int.TryParse(parts[0], out uniquePerfection);
+                if (parts.Length > 1) int.TryParse(parts[1], out uniqueRollCount);
+                if (parts.Length > 2) int.TryParse(parts[2], out uniqueModCount);
+            }
+            else if (raw.StartsWith("DETAIL|", StringComparison.Ordinal))
+            {
+                var detail = raw.Substring("DETAIL|".Length).Trim();
+                if (!string.Equals(detail, "QUALIFYING STATS", StringComparison.Ordinal) &&
+                    !string.IsNullOrWhiteSpace(detail))
+                    details.Add(detail);
+            }
+            else if (raw.StartsWith("SPECIAL|", StringComparison.Ordinal))
+            {
+                var special = raw.Substring("SPECIAL|".Length).Trim();
+                if (!string.IsNullOrWhiteSpace(special))
+                    specialMods.Add(special);
+            }
+        }
+
+        var scale = GetMinimalUiScale();
+        var draw = ImGuiNET.ImGui.GetForegroundDrawList();
+        var font = ImGuiNET.ImGui.GetFont();
+        var baseFontSize = ImGuiNET.ImGui.GetFontSize();
+        var width = attachBelow
+            ? Math.Max(300f * scale, itemRect.Width)
+            : Math.Max(340f * scale, Settings.ItemInfoWidth.Value * scale);
+        width = Math.Min(width, 560f * scale);
+        var headerHeight = 63f * scale;
+        var metaHeight = string.IsNullOrWhiteSpace(GetMinimalMetaText(metaParts))
+            ? 0f : 23f * scale;
+        var modRowHeight = 25f * scale;
+        var footerHeaderHeight = 27f * scale;
+        var detailRowHeight = 38f * scale;
+        var specialRowHeight = 20f * scale;
+        var perfectionFooterHeight = 42f * scale;
+        var qualifierColumns = Math.Min(3, Math.Max(1, details.Count));
+        var qualifierRows = details.Count > 0
+            ? (int)Math.Ceiling(details.Count / (double)qualifierColumns)
+            : 0;
+        var footerHeight = uniquePerfection >= 0
+            ? perfectionFooterHeight
+            : details.Count > 0 ? footerHeaderHeight + qualifierRows * detailRowHeight : 0f;
+        var height = headerHeight + metaHeight + modRows.Count * modRowHeight +
+                     specialMods.Count * specialRowHeight + footerHeight + 10f * scale;
+
+        var pos = GetAnalyzerPanelPosition(itemRect, width, height, attachBelow);
+        var x = pos.X;
+        var y = pos.Y;
+        var topLeft = new Vector2(x, y);
+        var bottomRight = new Vector2(x + width, y + height);
+        DrawMinimalCardBackground(draw, topLeft, bottomRight, attachBelow);
+        draw.PushClipRect(topLeft + Vector2.One,
+            bottomRight - Vector2.One, true);
+
+        var normal = ToImGuiColor(new Color(234, 235, 238, 255));
+        var subdued = ToImGuiColor(new Color(145, 149, 158, 255));
+        var mutedLine = ToImGuiColor(new Color(65, 68, 76, 160));
+        var gold = ToImGuiColor(GetColor(Settings.ItemInfoTierColor,
+            new Color(235, 190, 45, 255)));
+        var specialColor = ToImGuiColor(Settings.SpecialStarColor.Value);
+
+        var titleMaxWidth = width - 130f * scale;
+        var title = EllipsizeMinimalText(itemName.ToUpperInvariant(),
+            titleMaxWidth, 1.02f * scale);
+        draw.AddText(font, baseFontSize * 1.02f * scale,
+            new Vector2(x + 12f * scale, y + 10f * scale), normal, title);
+        draw.AddText(font, baseFontSize * .70f * scale,
+            new Vector2(x + 12f * scale, y + 35f * scale),
+            GetFullRarityColor(rarity), rarity.ToUpperInvariant());
+
+        if (uniquePerfection >= 0)
+        {
+            var scoreText = $"{uniquePerfection}%";
+            var scoreWidth = ImGuiNET.ImGui.CalcTextSize(scoreText).X *
+                             1.12f * scale;
+            draw.AddText(font, baseFontSize * 1.12f * scale,
+                new Vector2(x + width - 12f * scale - scoreWidth,
+                    y + 10f * scale), GetPerfectionColor(uniquePerfection),
+                scoreText);
+            var label = "PERFECTION";
+            var labelWidth = ImGuiNET.ImGui.CalcTextSize(label).X * .62f * scale;
+            draw.AddText(font, baseFontSize * .62f * scale,
+                new Vector2(x + width - 12f * scale - labelWidth,
+                    y + 37f * scale), subdued, label);
+        }
+        else
+        {
+            var starStart = x + width - 54f * scale;
+            // Full rare analyzers move their gold rating into the compact
+            // qualifier strip below. Keep header stars only when there is no
+            // qualifier footer, avoiding the same score in two places.
+            if (details.Count == 0)
+            {
+                for (var star = 0; star < 3; star++)
+                {
+                    var center = new Vector2(starStart + star * 16f * scale,
+                        y + 20f * scale);
+                    if (star < Math.Clamp(rating, 0, 3))
+                        DrawFivePointStar(draw, center, 5.6f * scale, gold);
+                    else
+                        DrawFivePointStarOutline(draw, center, 5.6f * scale,
+                            ToImGuiColor(new Color(100, 103, 112, 255)));
+                }
+            }
+
+            var specialStart = details.Count > 0
+                ? x + width - 18f * scale
+                : starStart;
+            for (var index = 0; index < Math.Min(2, specialMods.Count); index++)
+                DrawFivePointStar(draw,
+                    new Vector2(specialStart - (index + 1) * 15f * scale,
+                        y + 20f * scale), 4.8f * scale, specialColor);
+        }
+
+        var cy = y + headerHeight;
+        var meta = GetMinimalMetaText(metaParts);
+        if (!string.IsNullOrWhiteSpace(meta))
+        {
+            var clippedMeta = EllipsizeMinimalText(meta,
+                width - 24f * scale, .68f * scale);
+            draw.AddText(font, baseFontSize * .68f * scale,
+                new Vector2(x + 12f * scale, cy + 2f * scale), subdued,
+                clippedMeta);
+            cy += metaHeight;
+        }
+
+        var isUnique = string.Equals(rarity, "Unique",
+            StringComparison.OrdinalIgnoreCase);
+        for (var index = 0; index < modRows.Count; index++)
+        {
+            var mod = modRows[index];
+            var rowTop = cy + index * modRowHeight;
+            var statColor = GetCompactStatColor(mod.Text);
+            draw.AddRectFilled(new Vector2(x + 12f * scale, rowTop + 4f * scale),
+                new Vector2(x + 14f * scale, rowTop + modRowHeight - 4f * scale),
+                statColor, 1f);
+
+            var tierText = mod.Tier.Trim('[', ']');
+            var fixedUnique = isUnique && string.Equals(mod.Affix, "U",
+                StringComparison.OrdinalIgnoreCase) && string.IsNullOrEmpty(tierText);
+            var badgeWidth = fixedUnique ? 40f * scale :
+                string.IsNullOrEmpty(tierText) ? 0f : 36f * scale;
+            var textRight = x + width - 12f * scale -
+                            (badgeWidth > 0f ? badgeWidth + 8f * scale : 0f);
+            var text = EllipsizeMinimalText(mod.Text,
+                textRight - (x + 22f * scale), .79f * scale);
+            draw.AddText(font, baseFontSize * .79f * scale,
+                new Vector2(x + 22f * scale, rowTop + 3f * scale),
+                statColor, text);
+
+            if (fixedUnique)
+            {
+                var fixedText = "FIXED";
+                draw.AddText(font, baseFontSize * .60f * scale,
+                    new Vector2(x + width - 12f * scale - badgeWidth,
+                        rowTop + 5f * scale), subdued, fixedText);
+            }
+            else if (!string.IsNullOrEmpty(tierText))
+            {
+                var badgeColor = GetFullTierColor(tierText);
+                DrawMinimalBadge(draw, font, baseFontSize * .62f * scale,
+                    new Vector2(x + width - 12f * scale - badgeWidth,
+                        rowTop + 2f * scale), tierText, badgeColor,
+                    badgeWidth, 19f * scale);
+            }
+        }
+        cy += modRows.Count * modRowHeight;
+
+        for (var index = 0; index < specialMods.Count; index++)
+        {
+            var rowTop = cy + index * specialRowHeight;
+            draw.AddRectFilled(new Vector2(x + 12f * scale, rowTop + 4f * scale),
+                new Vector2(x + 14f * scale,
+                    rowTop + specialRowHeight - 4f * scale), specialColor, 1f);
+            var specialText = EllipsizeMinimalText(
+                specialMods[index].ToUpperInvariant(), width - 36f * scale,
+                .68f * scale);
+            draw.AddText(font, baseFontSize * .68f * scale,
+                new Vector2(x + 22f * scale, rowTop + 2f * scale),
+                specialColor, specialText);
+        }
+        cy += specialMods.Count * specialRowHeight;
+
+        if (uniquePerfection >= 0)
+        {
+            draw.AddLine(new Vector2(x + 12f * scale, cy + 2f * scale),
+                new Vector2(x + width - 12f * scale, cy + 2f * scale),
+                mutedLine, 1f);
+            draw.AddText(font, baseFontSize * .67f * scale,
+                new Vector2(x + 12f * scale, cy + 8f * scale), subdued,
+                "ITEM PERFECTION");
+            var barLeft = x + 12f * scale;
+            var barRight = x + width - 12f * scale;
+            var barTop = cy + 25f * scale;
+            var barHeight = 6f * scale;
+            draw.AddRectFilled(new Vector2(barLeft, barTop),
+                new Vector2(barRight, barTop + barHeight),
+                ToImGuiColor(new Color(50, 52, 59, 255)), 3f * scale);
+            draw.AddRectFilled(new Vector2(barLeft, barTop),
+                new Vector2(barLeft + (barRight - barLeft) *
+                    Math.Clamp(uniquePerfection / 100f, 0f, 1f),
+                    barTop + barHeight), GetPerfectionColor(uniquePerfection),
+                3f * scale);
+            var rollText = $"{FormatCountLabel(uniqueRollCount, "VARIABLE ROLL", "VARIABLE ROLLS")} · " +
+                           $"{FormatCountLabel(uniqueModCount, "MODIFIER", "MODIFIERS")} · FIXED EXCLUDED";
+            var rollWidth = ImGuiNET.ImGui.CalcTextSize(rollText).X * .56f * scale;
+            if (rollWidth < width - 24f * scale)
+                draw.AddText(font, baseFontSize * .56f * scale,
+                    new Vector2(x + width - 12f * scale - rollWidth,
+                        cy + 7f * scale), subdued, rollText);
+        }
+        else if (details.Count > 0)
+        {
+            draw.AddLine(new Vector2(x + 12f * scale, cy + 2f * scale),
+                new Vector2(x + width - 12f * scale, cy + 2f * scale),
+                mutedLine, 1f);
+            draw.AddText(font, baseFontSize * .67f * scale,
+                new Vector2(x + 12f * scale, cy + 8f * scale), subdued,
+                $"{details.Count} MATCHES");
+            cy += footerHeaderHeight;
+
+            var scoreWidth = 66f * scale;
+            var leftPadding = 12f * scale;
+            var rightPadding = 8f * scale;
+            var contentWidth = width - leftPadding - rightPadding - scoreWidth;
+            var cellWidth = contentWidth / qualifierColumns;
+            var footerTop = cy;
+            var footerBottom = cy + qualifierRows * detailRowHeight;
+            var faintLine = ToImGuiColor(new Color(125, 128, 136, 34));
+
+            for (var divider = 1; divider < qualifierColumns; divider++)
+            {
+                var dividerX = x + leftPadding + divider * cellWidth;
+                draw.AddLine(new Vector2(dividerX, footerTop + 4f * scale),
+                    new Vector2(dividerX, footerBottom - 4f * scale),
+                    faintLine, 1f);
+            }
+
+            for (var rowDivider = 1; rowDivider < qualifierRows; rowDivider++)
+            {
+                var dividerY = footerTop + rowDivider * detailRowHeight;
+                draw.AddLine(new Vector2(x + leftPadding, dividerY),
+                    new Vector2(x + leftPadding + contentWidth, dividerY),
+                    faintLine, 1f);
+            }
+
+            var scoreDividerX = x + width - rightPadding - scoreWidth;
+            draw.AddLine(new Vector2(scoreDividerX, footerTop + 4f * scale),
+                new Vector2(scoreDividerX, footerBottom - 4f * scale),
+                faintLine, 1f);
+
+            for (var index = 0; index < details.Count; index++)
+            {
+                if (!TryParseCompactDetail(details[index], out var label,
+                        out var actualValue, out var requiredValue, out var suffix))
+                    continue;
+
+                var column = index % qualifierColumns;
+                var row = index / qualifierColumns;
+                var cellX = x + leftPadding + column * cellWidth;
+                var rowTop = cy + row * detailRowHeight;
+                var statColor = GetCompactStatColor(label);
+                draw.AddRectFilled(new Vector2(cellX, rowTop + 4f * scale),
+                    new Vector2(cellX + 2f * scale,
+                        rowTop + detailRowHeight - 4f * scale), statColor, 1f);
+
+                var compactLabel = GetAttachedQualifierLabel(label, true)
+                    .ToUpperInvariant();
+                compactLabel = EllipsizeMinimalText(compactLabel,
+                    cellWidth - 16f * scale, .61f * scale);
+                draw.AddText(font, baseFontSize * .61f * scale,
+                    new Vector2(cellX + 8f * scale, rowTop + 1f * scale),
+                    statColor, compactLabel);
+
+                var actualText = $"{actualValue}{suffix}";
+                var minimumText = $"MIN {requiredValue}{suffix}";
+                var minimumWidth = ImGuiNET.ImGui.CalcTextSize(minimumText).X *
+                                   .48f * scale;
+                draw.AddText(font, baseFontSize * .79f * scale,
+                    new Vector2(cellX + 8f * scale, rowTop + 17f * scale),
+                    normal, actualText);
+                draw.AddText(font, baseFontSize * .48f * scale,
+                    new Vector2(cellX + cellWidth - 7f * scale - minimumWidth,
+                        rowTop + 21f * scale), subdued, minimumText);
+            }
+
+            var starSpacing = 16f * scale;
+            var starCenterX = scoreDividerX + scoreWidth * .5f;
+            var starY = footerTop + (footerBottom - footerTop) * .5f;
+            for (var star = 0; star < 3; star++)
+            {
+                var center = new Vector2(starCenterX - starSpacing +
+                    star * starSpacing, starY);
+                if (star < Math.Clamp(rating, 0, 3))
+                    DrawFivePointStar(draw, center, 5.4f * scale, gold);
+                else
+                    DrawFivePointStarOutline(draw, center, 5.4f * scale,
+                        ToImGuiColor(new Color(100, 103, 112, 255)));
             }
         }
 
@@ -5373,6 +6849,10 @@ private bool IsItemInfoPopupVisible()
             var modRows = GetAuthoritativeStatRows(mod);
             var affixCode = string.Empty;
             var isUniqueMod = false;
+            var isImplicitMod = mods.ImplicitMods != null &&
+                mods.ImplicitMods.Any(x => x != null &&
+                    string.Equals(x.RawName, mod.RawName,
+                        StringComparison.Ordinal));
 
             try
             {
@@ -5408,7 +6888,16 @@ private bool IsItemInfoPopupVisible()
 
             var tag = string.Empty;
 
-            if (isUniqueMod && TryGetUniqueModPerfection(mod,
+            // Some rare-item implicits use records whose AffixType is Unique.
+            // Identify them from the item's actual ImplicitMods collection
+            // before applying unique-roll perfection, otherwise a misleading
+            // percentage badge appears on rare items.
+            if (mods.ItemRarity != ItemRarity.Unique && isImplicitMod)
+            {
+                affixCode = "I";
+                tag = "[I]";
+            }
+            else if (isUniqueMod && TryGetUniqueModPerfection(mod,
                     out var modPerfection, out _))
             {
                 tag = $"[{Math.Clamp((int)Math.Round(modPerfection,
@@ -5455,6 +6944,77 @@ private bool IsItemInfoPopupVisible()
         return result;
     }
 
+    private static List<string> CombineAddedAttackDamageRows(
+        List<string> rows)
+    {
+        if (rows == null || rows.Count < 2)
+            return rows ?? new List<string>();
+
+        var combined = new List<string>(rows.Count);
+        for (var index = 0; index < rows.Count; index++)
+        {
+            if (index + 1 < rows.Count &&
+                TryParseAddedAttackDamageBound(rows[index],
+                    out var firstValue, out var firstBound,
+                    out var firstDamageType, out var firstAppliesToAttacks) &&
+                TryParseAddedAttackDamageBound(rows[index + 1],
+                    out var secondValue, out var secondBound,
+                    out var secondDamageType, out var secondAppliesToAttacks) &&
+                !string.Equals(firstBound, secondBound,
+                    StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(firstDamageType, secondDamageType,
+                    StringComparison.OrdinalIgnoreCase) &&
+                firstAppliesToAttacks == secondAppliesToAttacks)
+            {
+                var minimum = string.Equals(firstBound, "Minimum",
+                    StringComparison.OrdinalIgnoreCase)
+                    ? firstValue
+                    : secondValue;
+                var maximum = string.Equals(firstBound, "Maximum",
+                    StringComparison.OrdinalIgnoreCase)
+                    ? firstValue
+                    : secondValue;
+
+                combined.Add($"Adds {minimum.TrimStart('+')} to " +
+                             $"{maximum.TrimStart('+')} {firstDamageType} " +
+                             "Damage" +
+                             (firstAppliesToAttacks ? " to Attacks" : string.Empty));
+                index++;
+                continue;
+            }
+
+            combined.Add(rows[index]);
+        }
+
+        return combined;
+    }
+
+    private static bool TryParseAddedAttackDamageBound(string row,
+        out string value, out string bound, out string damageType,
+        out bool appliesToAttacks)
+    {
+        value = string.Empty;
+        bound = string.Empty;
+        damageType = string.Empty;
+        appliesToAttacks = false;
+
+        var match = System.Text.RegularExpressions.Regex.Match(
+            row ?? string.Empty,
+            @"^([+-]?\d+(?:\.\d+)?)\s+(?:(Attack)\s+)?" +
+            @"(Minimum|Maximum)\s+Added\s+" +
+            @"(Physical|Fire|Cold|Lightning|Chaos)\s+Damage$",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        if (!match.Success)
+            return false;
+
+        value = match.Groups[1].Value;
+        appliesToAttacks = match.Groups[2].Success;
+        bound = match.Groups[3].Value;
+        damageType = System.Globalization.CultureInfo.InvariantCulture.TextInfo
+            .ToTitleCase(match.Groups[4].Value.ToLowerInvariant());
+        return true;
+    }
+
     private List<string> GetAuthoritativeStatRows(ItemMod mod)
     {
         var result = new List<string>();
@@ -5495,7 +7055,7 @@ private bool IsItemInfoPopupVisible()
             // Translation/reflection fallback below will still display the mod.
         }
 
-        return result;
+        return CombineAddedAttackDamageRows(result);
     }
 
     private static string FormatAuthoritativeStatLine(
@@ -5510,6 +7070,24 @@ private bool IsItemInfoPopupVisible()
             ? valueText
             : "+" + valueText;
         var unsigned = valueText.TrimStart('+');
+
+        // Several PoE stat records store display values in internal units.
+        // Translate those units before building the player-facing line.
+        if (key.Contains("life_regeneration_rate_per_minute",
+                StringComparison.Ordinal) &&
+            TryParseDisplayNumber(valueText, out var regenerationPerMinute))
+        {
+            return $"{FormatDisplayNumber(regenerationPerMinute / 60d, 1)} " +
+                   "Life Regenerated per Second";
+        }
+
+        if (key.Contains("life_leech_from_physical_attack_damage_permyriad",
+                StringComparison.Ordinal) &&
+            TryParseDisplayNumber(valueText, out var leechPermyriad))
+        {
+            return $"{FormatDisplayNumber(leechPermyriad / 100d, 2)}% of Physical " +
+                   "Attack Damage Leeched as Life";
+        }
 
         switch (key)
         {
@@ -5556,6 +7134,34 @@ private bool IsItemInfoPopupVisible()
         return string.IsNullOrWhiteSpace(human)
             ? (valueText + " " + statText).Trim()
             : (valueText + " " + human).Trim();
+    }
+
+    private static bool TryParseDisplayNumber(string text, out double value)
+    {
+        value = 0d;
+        var match = System.Text.RegularExpressions.Regex.Match(text ?? string.Empty,
+            @"[-+]?\d+(?:\.\d+)?");
+        if (!match.Success)
+            return false;
+
+        return double.TryParse(match.Value,
+            System.Globalization.NumberStyles.Float,
+            System.Globalization.CultureInfo.InvariantCulture, out value);
+    }
+
+    private static string FormatDisplayNumber(double value, int maximumDecimals)
+    {
+        var format = maximumDecimals <= 0
+            ? "0"
+            : "0." + new string('#', maximumDecimals);
+        return value.ToString(format,
+            System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    private static string FormatCountLabel(int count, string singular,
+        string plural)
+    {
+        return $"{count} {(count == 1 ? singular : plural)}";
     }
 
     private static string HumanizeInternalStatKey(string key)

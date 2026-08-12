@@ -65,12 +65,27 @@ public partial class InventoryItemAnalyzer
         DrawItemInfoModeSelector();
 
         if (Settings.ShowItemInfo.Value)
+        {
             DrawDefaultAnalyzerViewSelector();
+
+            ImGui.Spacing();
+            ImGui.TextDisabled("PLACEMENT & SOURCES");
+            ImGui.Separator();
+            ImGui.TextDisabled(
+                "LootLens is attached directly to the native item tooltip.");
+            Toggle("Show analyzer on equipped items",
+                Settings.ItemInfoShowEquippedItems);
+            ImGui.TextDisabled(
+                "Inventory and stash analysis remain enabled when this is off.");
+        }
 
         ImGui.Spacing();
         ImGui.TextDisabled("APPEARANCE");
         ImGui.Separator();
         Slider("Width", Settings.ItemInfoWidth);
+        Slider("UI Scale", Settings.ItemInfoMinimalScale);
+        ImGui.TextDisabled(
+            "Attached compact mode automatically uses the native tooltip width.");
         ColorNodeEditor("Background", Settings.ItemInfoBackground);
         ColorNodeEditor("Border", Settings.ItemInfoBorder);
         ColorNodeEditor("Tier Highlight", Settings.ItemInfoTierColor);
@@ -78,8 +93,9 @@ public partial class InventoryItemAnalyzer
         if (ImGui.Button("Reset Analyzer Appearance"))
         {
             Settings.ItemInfoWidth.Value = 310;
-            Settings.ItemInfoBackground.Value = new SharpDX.Color(15, 15, 20, 245);
-            Settings.ItemInfoBorder.Value = new SharpDX.Color(110, 110, 125, 255);
+            Settings.ItemInfoMinimalScale.Value = 115;
+            Settings.ItemInfoBackground.Value = new SharpDX.Color(0, 0, 0, 236);
+            Settings.ItemInfoBorder.Value = new SharpDX.Color(0, 0, 0, 0);
             Settings.ItemInfoTierColor.Value = SharpDX.Color.Gold;
         }
 
