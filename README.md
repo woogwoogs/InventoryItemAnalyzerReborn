@@ -13,6 +13,11 @@ item analysis plugin that helps you quickly identify promising equipment using c
 * affix tiers with crafted and implicit modifier badges
 * phys/ele/total wep dps calcs
 
+## Settings
+
+<img width="970" height="822" alt="image" src="https://github.com/user-attachments/assets/95f31f47-2c2b-496d-bd1e-c1792fcaadd0" />
+
+
 ## Compact Item Analysis
 
 A condensed rating bar displays qualifying stats, configured thresholds, and the resulting star rating without covering the item tooltip.
